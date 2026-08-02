@@ -17,6 +17,9 @@ DEFAULT_WARP_SIZE = 840
 class BoardProfile:
     board_size: int
     corners: tuple[tuple[float, float], ...]
+    source_width: int | None = None
+    source_height: int | None = None
+    window_title: str | None = None
     warp_size: int = DEFAULT_WARP_SIZE
     black_gray_max: float = 82.0
     black_fraction_min: float = 0.46
@@ -40,6 +43,9 @@ class BoardProfile:
         return {
             "board_size": self.board_size,
             "corners": [list(point) for point in self.corners],
+            "source_width": self.source_width,
+            "source_height": self.source_height,
+            "window_title": self.window_title,
             "warp_size": self.warp_size,
             "black_gray_max": self.black_gray_max,
             "black_fraction_min": self.black_fraction_min,
@@ -53,6 +59,15 @@ class BoardProfile:
         return cls(
             board_size=int(data["board_size"]),
             corners=tuple(tuple(map(float, point)) for point in data["corners"]),  # type: ignore[arg-type]
+            source_width=(
+                int(data["source_width"]) if data.get("source_width") is not None else None
+            ),
+            source_height=(
+                int(data["source_height"]) if data.get("source_height") is not None else None
+            ),
+            window_title=(
+                str(data["window_title"]) if data.get("window_title") is not None else None
+            ),
             warp_size=int(data.get("warp_size", DEFAULT_WARP_SIZE)),
             black_gray_max=float(data.get("black_gray_max", 82.0)),
             black_fraction_min=float(data.get("black_fraction_min", 0.46)),
@@ -60,6 +75,13 @@ class BoardProfile:
             white_fraction_min=float(data.get("white_fraction_min", 0.42)),
             white_saturation_max=float(data.get("white_saturation_max", 65.0)),
         )
+
+    def matches_source(self, frame_bgr: np.ndarray, window_title: str | None) -> bool:
+        if self.source_width is None or self.source_height is None:
+            return False
+        if frame_bgr.shape[:2] != (self.source_height, self.source_width):
+            return False
+        return self.window_title is None or self.window_title == window_title
 
 
 @dataclass(frozen=True)
@@ -227,4 +249,3 @@ class StableStateTracker:
             self.committed = candidate
             return transition, candidate
         return transition, None
-

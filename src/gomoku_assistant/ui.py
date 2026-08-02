@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,16 @@ from PySide6.QtWidgets import (
 )
 
 from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer
-from .capture import WindowInfo, get_window_info, list_visible_windows
+from .capture import (
+    BlankFrameError,
+    CaptureError,
+    CaptureUnavailableError,
+    WindowCaptureSession,
+    WindowInfo,
+    get_window_info,
+    is_blank_frame,
+    list_visible_windows,
+)
 from .domain import BoardState, Stone
 from .engine import RapfiAnalyzer, RapfiConfig
 from .sessions import SessionLogger
@@ -352,6 +362,7 @@ class MainWindow(QMainWindow):
         self._profile: BoardProfile | None = self._load_profile()
         self._last_frame: np.ndarray | None = None
         self._last_window: WindowInfo | None = None
+        self._capture_session = WindowCaptureSession()
         self._tracker = StableStateTracker()
         self._overlay = SuggestionOverlay()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -369,6 +380,7 @@ class MainWindow(QMainWindow):
         self._preview.setStyleSheet("background: #202124; color: #dddddd;")
 
         self._window_combo = QComboBox()
+        self._window_combo.currentIndexChanged.connect(self._on_target_window_changed)
         self._refresh_windows_button = QPushButton("Refresh windows")
         self._refresh_windows_button.clicked.connect(self.refresh_windows)
         self._capture_button = QPushButton("Capture frame")
@@ -480,7 +492,11 @@ class MainWindow(QMainWindow):
         path.write_text(json.dumps(self._profile.to_dict(), indent=2), encoding="utf-8")
 
     def _profile_status_text(self) -> str:
-        return "15x15 calibrated" if self._profile else "Not calibrated"
+        if self._profile is None:
+            return "Not calibrated"
+        if self._profile.source_width is None:
+            return "Legacy profile: recalibrate"
+        return "15x15 calibrated"
 
     def _engine_status_text(self) -> str:
         if self._rapfi_path and self._rapfi_path.is_file():
@@ -507,6 +523,15 @@ class MainWindow(QMainWindow):
         if self._window_combo.count() == 0:
             self._status.setText("No eligible Windows application window found.")
 
+    def _on_target_window_changed(self, _: int) -> None:
+        self._capture_session.stop()
+        self._last_frame = None
+        self._last_window = None
+        self._tracker.reset()
+        self._overlay.hide()
+        self._preview.setPixmap(QPixmap())
+        self._preview.setText("No frame captured")
+
     def capture_frame(self) -> np.ndarray | None:
         handle = self._selected_handle()
         if handle is None:
@@ -517,32 +542,48 @@ class MainWindow(QMainWindow):
             self._status.setText("Target window is no longer available.")
             return None
 
-        overlay_was_visible = self._overlay.isVisible()
-        if overlay_was_visible:
-            self._overlay.hide()
         try:
-            screen = QGuiApplication.primaryScreen()
-            if screen is None:
-                self._status.setText("No primary screen is available.")
+            captured = self._capture_session.latest_frame(window)
+            frame = captured.frame_bgr
+        except CaptureUnavailableError:
+            frame = self._capture_with_qt_fallback(handle)
+            if frame is None:
                 return None
-            pixmap = screen.grabWindow(handle)
-        finally:
-            if overlay_was_visible and self._overlay_toggle.isChecked():
-                self._overlay.show()
-        if pixmap.isNull():
-            self._status.setText("Windows did not return a capturable frame for this window.")
+        except (BlankFrameError, CaptureError) as error:
+            self._last_frame = None
+            self._last_window = None
+            self._preview.setPixmap(QPixmap())
+            self._preview.setText("No valid frame captured")
+            self._status.setText(str(error))
             return None
 
-        self._last_frame = _pixmap_to_bgr(pixmap)
+        self._last_frame = frame
         self._last_window = window
         self._preview.setPixmap(
-            pixmap.scaled(
+            _bgr_to_pixmap(frame).scaled(
                 self._preview.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
         return self._last_frame
+
+    def _capture_with_qt_fallback(self, handle: int) -> np.ndarray | None:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self._status.setText("No primary screen is available.")
+            return None
+        pixmap = screen.grabWindow(handle)
+        if pixmap.isNull():
+            self._status.setText("Windows did not return a capturable frame for this window.")
+            return None
+        frame = _pixmap_to_bgr(pixmap)
+        if is_blank_frame(frame):
+            self._status.setText(
+                "Qt fallback captured a blank frame. Install windows-capture and retry."
+            )
+            return None
+        return frame
 
     def open_screenshot(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -577,7 +618,12 @@ class MainWindow(QMainWindow):
         dialog = CalibrationDialog(self._last_frame, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._profile = dialog.profile()
+        self._profile = replace(
+            dialog.profile(),
+            source_width=self._last_frame.shape[1],
+            source_height=self._last_frame.shape[0],
+            window_title=self._last_window.title if self._last_window else None,
+        )
         self._tracker.reset()
         self._save_profile()
         self._profile_status.setText(self._profile_status_text())
@@ -588,6 +634,19 @@ class MainWindow(QMainWindow):
             self._observe_button.setChecked(False)
             QMessageBox.information(self, "Calibration required", "Calibrate the 15x15 board first.")
             return
+        if enabled:
+            frame = self.capture_frame()
+            if frame is None or self._last_window is None:
+                self._observe_button.setChecked(False)
+                return
+            if not self._profile.matches_source(frame, self._last_window.title):
+                self._observe_button.setChecked(False)
+                QMessageBox.information(
+                    self,
+                    "Calibration required",
+                    "The selected window or capture size changed. Capture a frame and calibrate again.",
+                )
+                return
         self._observe_button.setText("Stop observing" if enabled else "Start observing")
         if enabled:
             self._tracker.reset()
@@ -751,6 +810,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self._capture_timer.stop()
+        self._capture_session.stop()
         self._overlay.hide()
         target = self._session.save()
         if self._rapfi_analyzer is not None:
