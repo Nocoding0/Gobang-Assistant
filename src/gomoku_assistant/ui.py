@@ -465,7 +465,7 @@ class MainWindow(QMainWindow):
         self._search_time = QSpinBox()
         self._search_time.setRange(100, 10_000)
         self._search_time.setSingleStep(100)
-        self._search_time.setValue(1000)
+        self._search_time.setValue(3000)
         self._edit_mode = QComboBox()
         self._edit_mode.addItem("Auto move", None)
         self._edit_mode.addItem("Place black", Stone.BLACK)
@@ -477,6 +477,7 @@ class MainWindow(QMainWindow):
         self._my_color.addItem("Black", Stone.BLACK)
         self._my_color.addItem("White", Stone.WHITE)
         self._my_color.addItem("Analyze both colors", "both")
+        self._my_color.currentIndexChanged.connect(self._on_my_color_changed)
         self._overlay_toggle = QCheckBox("Show transparent overlay")
         self._overlay_toggle.setChecked(True)
         self._overlay_toggle.toggled.connect(self._refresh_overlay)
@@ -597,7 +598,8 @@ class MainWindow(QMainWindow):
         self._last_frame = None
         self._last_window = None
         self._tracker.reset()
-        self._overlay.hide()
+        self._set_board(BoardState.empty(), analyze=False)
+        self._candidate_text.setText("No analysis yet")
         self._preview.setPixmap(QPixmap())
         self._preview.setText("No frame captured")
         handle = self._selected_handle()
@@ -705,6 +707,7 @@ class MainWindow(QMainWindow):
             window_title=self._last_window.title if self._last_window else None,
         )
         self._tracker.reset()
+        self._invalidate_analysis()
         self._save_profile()
         self._profile_status.setText(self._profile_status_text())
         self._status.setText("Calibration saved. Start observation or capture a new frame.")
@@ -752,11 +755,13 @@ class MainWindow(QMainWindow):
         self._observe_button.setText("Stop observing" if enabled else "Start observing")
         if enabled:
             self._tracker.reset()
+            self._set_board(BoardState.empty(), analyze=False)
+            self._candidate_text.setText("Waiting for a stable board frame.")
             self._capture_timer.start()
             self._status.setText("Observing target window.")
         else:
             self._capture_timer.stop()
-            self._overlay.hide()
+            self._invalidate_analysis()
             self._status.setText("Observation paused.")
 
     def _observe_tick(self) -> None:
@@ -781,14 +786,18 @@ class MainWindow(QMainWindow):
                     f"Synced B{black}/W{white}; {transition.reason}; analyzing {next_side}."
                 )
             else:
-                self._candidate_text.setText(f"Synced. Waiting for your {next_side} turn.")
+                self._candidate_text.setText(f"Synced. Waiting for opponent ({next_side}).")
                 self._status.setText(
-                    f"Synced B{black}/W{white}; {transition.reason}; waiting for {next_side}."
+                    f"Synced B{black}/W{white}; {transition.reason}; opponent {next_side} to move."
                 )
         elif not transition.valid:
-            self._overlay.hide()
+            self._invalidate_analysis()
             if recognition.obstruction_reason is not None:
+                black, white = self._board.counts()
                 self._status.setText("Paused: board is covered; waiting for a clear frame.")
+                self._candidate_text.setText(
+                    f"Last confirmed board: B{black}/W{white}. Waiting for the popup to clear."
+                )
             else:
                 black, white = recognition.board.counts()
                 self._status.setText(
@@ -806,6 +815,16 @@ class MainWindow(QMainWindow):
         my_color = self._my_color.currentData()
         return my_color == "both" or board.side_to_move() is my_color
 
+    def _on_my_color_changed(self, _: int) -> None:
+        self._invalidate_analysis()
+        if not self._observe_button.isChecked():
+            return
+        self._tracker.reset()
+        self._set_board(BoardState.empty(), analyze=False)
+        selected = self._my_color.currentText()
+        self._candidate_text.setText("Color changed. Waiting for a stable board frame.")
+        self._status.setText(f"Color changed to {selected}. Resynchronizing current board.")
+
     def _update_edit_mode(self) -> None:
         value = self._edit_mode.currentData()
         self._board_canvas.set_edit_mode(value)
@@ -815,13 +834,17 @@ class MainWindow(QMainWindow):
         self._status.setText("Manual board edited. Select Analyze position when ready.")
 
     def _set_board(self, board: BoardState, analyze: bool) -> None:
+        self._invalidate_analysis()
         self._board = board
         self._board_canvas.set_board(board)
+        if analyze:
+            self.analyze_current_board()
+
+    def _invalidate_analysis(self) -> None:
+        self._analysis_version += 1
         self._candidates = ()
         self._board_canvas.set_candidates(())
         self._overlay.hide()
-        if analyze:
-            self.analyze_current_board()
 
     def clear_board(self) -> None:
         self._tracker.reset()
@@ -838,6 +861,7 @@ class MainWindow(QMainWindow):
         )
         if not filename:
             return
+        self._invalidate_analysis()
         if self._rapfi_analyzer is not None:
             self._rapfi_analyzer.close()
             self._rapfi_analyzer = None
@@ -892,16 +916,18 @@ class MainWindow(QMainWindow):
         result = payload
         if not isinstance(result, AnalysisResult):
             return
+        if result.board != self._board:
+            return
         self._candidates = result.candidates
         self._board_canvas.set_candidates(result.candidates)
-        self._session.append(self._board, result)
+        self._session.append(result)
         if not result.candidates:
             self._candidate_text.setText(f"{result.engine_name}: no legal move.")
             return
         self._candidate_text.setText(
             "\n".join(
                 f"{move.rank}. {self._board.coordinate_name(move.x, move.y)}"
-                f"  {'engine choice' if move.score is None else f'score {move.score:+d}'}"
+                f"  {self._candidate_label(move, result)}"
                 f"  {move.proof.value}"
                 for move in result.candidates
             )
@@ -909,6 +935,14 @@ class MainWindow(QMainWindow):
         )
         self._status.setText(f"Analysis ready from {result.engine_name}.")
         self._refresh_overlay()
+
+    @staticmethod
+    def _candidate_label(move: CandidateMove, result: AnalysisResult) -> str:
+        if move.rank == 1 and result.engine_name.startswith("Rapfi"):
+            return "Rapfi best"
+        if move.rank > 1 and result.engine_name == "Rapfi + tactical alternatives":
+            return "local alternative"
+        return "engine choice" if move.score is None else f"score {move.score:+d}"
 
     def _refresh_overlay(self) -> None:
         if (

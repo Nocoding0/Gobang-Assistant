@@ -6,9 +6,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis import AnalysisResult
-from .domain import BoardState
-
-
 @dataclass(frozen=True)
 class SessionEntry:
     at_utc: str
@@ -23,12 +20,12 @@ class SessionLogger:
         self.directory = directory
         self.entries: list[SessionEntry] = []
 
-    def append(self, board: BoardState, result: AnalysisResult) -> None:
+    def append(self, result: AnalysisResult) -> None:
         self.entries.append(
             SessionEntry(
                 at_utc=datetime.now(timezone.utc).isoformat(),
-                board=tuple(int(cell) for cell in board.cells),
-                size=board.size,
+                board=tuple(int(cell) for cell in result.board.cells),
+                size=result.board.size,
                 engine=result.engine_name,
                 candidates=tuple(
                     {

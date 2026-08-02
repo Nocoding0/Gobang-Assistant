@@ -74,8 +74,8 @@ To test the engine without screen recognition, place stones on the left board an
 - `My color`: 每局开始前选择自己执黑、执白或双方分析。棋盘始终同步双方落子，但只有轮到你的棋色时才显示推荐。
   Choose black, white, or both before each game. The board always syncs both
   sides, but suggestions appear only when it is your selected color's turn.
-- `Rapfi search`: 每个局面的搜索时长，默认 `1000 ms`。  
-  Search duration per position; the default is `1000 ms`.
+- `Rapfi search`: 每个局面的搜索时长，默认 `3000 ms`。
+  Search duration per position; the default is `3000 ms`.
 - `Select Rapfi.exe`: 仅在更换引擎文件时使用。  
   Use this only when changing the engine executable.
 

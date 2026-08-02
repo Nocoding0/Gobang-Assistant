@@ -166,6 +166,29 @@ def test_state_tracker_requires_stable_frames() -> None:
     assert transition.valid
 
 
+def test_state_tracker_commits_the_first_black_stone_for_white_mode() -> None:
+    board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    recognition = RecognitionResult(
+        board=board,
+        confidence=1.0,
+        cell_confidences=(1.0,) * 225,
+        board_visible=True,
+        grid_score=1.0,
+        warped=np.zeros((841, 841, 3), dtype=np.uint8),
+    )
+    tracker = StableStateTracker(required_frames=3)
+
+    _, first = tracker.observe(recognition)
+    _, second = tracker.observe(recognition)
+    transition, third = tracker.observe(recognition)
+
+    assert first is None
+    assert second is None
+    assert transition.valid
+    assert transition.reason == "initial state"
+    assert third == board
+
+
 def test_state_tracker_pauses_for_banner_then_recovers() -> None:
     frame, profile = _synthetic_board()
     banner = frame.copy()

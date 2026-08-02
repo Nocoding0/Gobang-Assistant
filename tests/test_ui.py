@@ -6,7 +6,9 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
-from gomoku_assistant.ui import CalibrationDialog
+from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus
+from gomoku_assistant.domain import BoardState, Stone
+from gomoku_assistant.ui import CalibrationDialog, MainWindow
 
 
 def test_low_contrast_calibration_allows_save() -> None:
@@ -24,3 +26,49 @@ def test_low_contrast_calibration_allows_save() -> None:
     assert application is not None
     assert save_button.isEnabled()
     assert "Low-contrast" in dialog._hint.text()
+
+
+def test_stale_analysis_result_does_not_replace_new_board() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    old_board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    current_board = old_board.set_cell(7, 6, Stone.WHITE)
+    stale = AnalysisResult(
+        board=old_board,
+        candidates=(
+            CandidateMove(
+                x=6,
+                y=7,
+                rank=1,
+                score=100,
+                proof=ProofStatus.HEURISTIC,
+            ),
+        ),
+        engine_name="Rapfi",
+    )
+    window._board = current_board
+    window._analysis_version = 4
+
+    window._on_analysis_ready(4, stale)
+
+    assert application is not None
+    assert window._candidates == ()
+    window.close()
+
+
+def test_switching_to_white_while_observing_resynchronizes_board() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    window._tracker.committed = window._board
+    window._observe_button.blockSignals(True)
+    window._observe_button.setChecked(True)
+    window._observe_button.blockSignals(False)
+
+    window._my_color.setCurrentIndex(2)
+
+    assert application is not None
+    assert window._board == BoardState.empty()
+    assert window._tracker.committed is None
+    assert "Resynchronizing" in window._status.text()
+    window.close()

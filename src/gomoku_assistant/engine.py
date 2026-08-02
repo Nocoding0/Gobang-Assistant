@@ -13,7 +13,9 @@ from .domain import BoardState, Stone
 
 
 COORDINATE_RE = re.compile(r"(?<!\d)(\d{1,2}),(\d{1,2})(?!\d)")
-MULTIPV_RE = re.compile(r"^MESSAGE\s+\((\d+)\)\s+(-?\d+)")
+ALGEBRAIC_COORDINATE_RE = re.compile(r"(?<![A-Z])([A-O])(1[0-5]|[1-9])(?!\d)")
+MULTIPV_RE = re.compile(r"^MESSAGE\s+\((\d+)\)\s+([+-]?(?:M\d+|\d+))")
+FINAL_EVAL_RE = re.compile(r"^MESSAGE\s+Depth\b.*\|\s+Eval\s+([+-]?(?:M\d+|\d+))\s+\|")
 
 
 class EngineProtocolError(RuntimeError):
@@ -23,7 +25,7 @@ class EngineProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class RapfiConfig:
     executable: Path
-    time_ms: int = 1000
+    time_ms: int = 3000
     threads: int = 4
     hash_kib: int = 256 * 1024
     startup_timeout_s: float = 25.0
@@ -34,50 +36,69 @@ def parse_rapfi_output(
 ) -> tuple[CandidateMove, ...]:
     """Extract ranked candidate moves from Rapfi Yixin detail messages."""
 
-    found: list[CandidateMove] = []
-    seen: set[tuple[int, int]] = set()
+    ranked: dict[int, CandidateMove] = {}
     fallback_point: tuple[int, int] | None = None
+    final_score: int | None = None
+    final_proof = ProofStatus.HEURISTIC
+    has_final_evaluation = False
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        coordinate_matches = COORDINATE_RE.findall(line)
         if line and re.fullmatch(r"\d{1,2},\d{1,2}", line):
             fallback_point = tuple(map(int, line.split(",")))
+        final_eval = FINAL_EVAL_RE.match(line)
+        if final_eval:
+            final_score, final_proof = _parse_rapfi_score(final_eval.group(1))
+            has_final_evaluation = True
 
         match = MULTIPV_RE.match(line)
-        if not match or not coordinate_matches:
+        coordinates = _parse_output_coordinates(line)
+        if not match or not coordinates:
             continue
         rank = int(match.group(1))
-        score = int(match.group(2))
-        x, y = map(int, coordinate_matches[0])
-        if not board.in_bounds(x, y) or board.at(x, y) is not Stone.EMPTY or (x, y) in seen:
+        x, y = coordinates[0]
+        if not board.in_bounds(x, y) or board.at(x, y) is not Stone.EMPTY:
             continue
-        proof = ProofStatus.FORCED_WIN if abs(score) >= 29_000 else ProofStatus.HEURISTIC
-        pv = tuple((int(px), int(py)) for px, py in coordinate_matches)
-        found.append(
-            CandidateMove(x=x, y=y, rank=rank, score=score, proof=proof, principal_variation=pv)
+        score, proof = _parse_rapfi_score(match.group(2))
+        ranked[rank] = CandidateMove(
+            x=x,
+            y=y,
+            rank=rank,
+            score=score,
+            proof=proof,
+            principal_variation=coordinates,
         )
-        seen.add((x, y))
 
-    if fallback_point and fallback_point not in seen:
+    if fallback_point:
         x, y = fallback_point
         if board.in_bounds(x, y) and board.at(x, y) is Stone.EMPTY:
-            found.append(
-                CandidateMove(
-                    x=x,
-                    y=y,
-                    rank=len(found) + 1,
-                    score=None,
-                    proof=(
-                        ProofStatus.WIN_IN_ONE
-                        if board.place(x, y).winner() is board.side_to_move()
-                        else ProofStatus.HEURISTIC
-                    ),
-                    principal_variation=((x, y),),
+            current = ranked.get(1)
+            proof = (
+                ProofStatus.WIN_IN_ONE
+                if board.place(x, y).winner() is board.side_to_move()
+                else (
+                    final_proof
+                    if has_final_evaluation
+                    else current.proof if current is not None else ProofStatus.HEURISTIC
                 )
             )
+            ranked[1] = CandidateMove(
+                x=x,
+                y=y,
+                rank=1,
+                score=(
+                    final_score
+                    if has_final_evaluation
+                    else current.score if current is not None else None
+                ),
+                proof=proof,
+                principal_variation=(
+                    current.principal_variation
+                    if current is not None and (current.x, current.y) == fallback_point
+                    else ((x, y),)
+                ),
+            )
 
-    found.sort(key=lambda move: move.rank)
     return tuple(
         CandidateMove(
             x=move.x,
@@ -87,8 +108,53 @@ def parse_rapfi_output(
             proof=move.proof,
             principal_variation=move.principal_variation,
         )
-        for index, move in enumerate(found[:limit], start=1)
+        for index, move in enumerate(
+            (ranked[rank] for rank in sorted(ranked)[:limit]), start=1
+        )
     )
+
+
+def _parse_output_coordinates(line: str) -> tuple[tuple[int, int], ...]:
+    coordinate_text = line.rsplit("|", 1)[-1] if line.startswith("MESSAGE ") else line
+    numeric = tuple(
+        (int(x), int(y)) for x, y in COORDINATE_RE.findall(coordinate_text)
+    )
+    if numeric:
+        return numeric
+    return tuple(
+        (ord(column) - ord("A"), int(row) - 1)
+        for column, row in ALGEBRAIC_COORDINATE_RE.findall(coordinate_text.upper())
+    )
+
+
+def _parse_rapfi_score(value: str) -> tuple[int | None, ProofStatus]:
+    if "M" in value:
+        return (
+            None,
+            ProofStatus.FORCED_WIN if not value.startswith("-") else ProofStatus.FORCED_LOSS,
+        )
+    score = int(value)
+    if score >= 29_000:
+        return score, ProofStatus.FORCED_WIN
+    if score <= -29_000:
+        return score, ProofStatus.FORCED_LOSS
+    return score, ProofStatus.HEURISTIC
+
+
+def _build_rapfi_search_commands(board: BoardState) -> list[str]:
+    """Build a board request with one full-strength Rapfi principal variation."""
+
+    side = board.side_to_move()
+    commands = ["INFO SHOW_DETAIL 3", "YXBOARD"]
+    for y in range(board.size):
+        for x in range(board.size):
+            stone = board.at(x, y)
+            if stone is Stone.EMPTY:
+                continue
+            color = 1 if stone is side else 2
+            commands.append(f"{x},{y},{color}")
+    commands.extend(["DONE", "YXNBEST 1"])
+    return commands
 
 
 class RapfiAnalyzer:
@@ -121,17 +187,7 @@ class RapfiAnalyzer:
         with self._lock:
             self._ensure_started()
             self._discard_pending_messages()
-            side = board.side_to_move()
-            commands = ["INFO SHOW_DETAIL 3", "YXBOARD"]
-            for y in range(board.size):
-                for x in range(board.size):
-                    stone = board.at(x, y)
-                    if stone is Stone.EMPTY:
-                        continue
-                    color = 1 if stone is side else 2
-                    commands.append(f"{x},{y},{color}")
-            commands.extend(["DONE", f"YXNBEST {limit}"])
-            self._write_commands(commands)
+            self._write_commands(_build_rapfi_search_commands(board))
 
             extra_wait = self.config.startup_timeout_s if not self._warmed else 3.0
             deadline = time.monotonic() + (self.config.time_ms / 1000) + extra_wait
@@ -152,7 +208,7 @@ class RapfiAnalyzer:
                     break
 
             raw_output = "\n".join(output)
-            candidates = parse_rapfi_output(raw_output, board, limit=limit)
+            candidates = parse_rapfi_output(raw_output, board, limit=1)
             if not final_move_seen and not candidates:
                 self.close()
                 raise EngineProtocolError(

@@ -444,7 +444,7 @@ class StableStateTracker:
         self,
         required_frames: int = 3,
         min_confidence: float = 0.70,
-        reset_frames: int = 5,
+        reset_frames: int = 2,
     ) -> None:
         if required_frames < 1:
             raise ValueError("required_frames must be positive")
