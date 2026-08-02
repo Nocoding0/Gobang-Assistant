@@ -1,0 +1,14 @@
+.venv/
+.claude/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.spec
+sessions/
+profiles/
+vendor/rapfi/*
+!vendor/rapfi/.gitkeep
+!vendor/rapfi/README.md

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gomoku-training-assistant"
+version = "0.1.0"
+description = "Local Windows Gomoku training assistant with screen calibration and engine integration."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Local user" }]
+dependencies = [
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+  "PySide6==6.8.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+gomoku-trainer = "gomoku_assistant.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gomoku_assistant"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
