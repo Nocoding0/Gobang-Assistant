@@ -27,6 +27,21 @@ def _synthetic_board() -> tuple[np.ndarray, BoardProfile]:
     return canvas, profile
 
 
+def _blue_board_with_stars() -> tuple[np.ndarray, BoardProfile]:
+    edge = 840
+    canvas = np.full((edge + 1, edge + 1, 3), (180, 142, 98), dtype=np.uint8)
+    for coordinate in range(0, edge + 1, 60):
+        cv2.line(canvas, (coordinate, 0), (coordinate, edge), (90, 56, 72), 2)
+        cv2.line(canvas, (0, coordinate), (edge, coordinate), (90, 56, 72), 2)
+    for x, y in ((3, 3), (11, 3), (3, 11), (11, 11)):
+        cv2.circle(canvas, (x * 60, y * 60), 10, (70, 42, 58), -1)
+    profile = BoardProfile(
+        board_size=15,
+        corners=((0, 0), (edge, 0), (edge, edge), (0, edge)),
+    )
+    return canvas, profile
+
+
 def test_recognizes_synthetic_black_and_white_stones() -> None:
     frame, profile = _synthetic_board()
 
@@ -37,6 +52,7 @@ def test_recognizes_synthetic_black_and_white_stones() -> None:
     assert result.board.at(0, 0) is Stone.EMPTY
     assert result.board_visible
     assert result.grid_score >= 0.35
+    assert result.confidence >= 0.70
 
 
 def test_recognizes_black_stone_with_colored_last_move_marker() -> None:
@@ -46,6 +62,48 @@ def test_recognizes_black_stone_with_colored_last_move_marker() -> None:
     result = recognize_frame(frame, profile)
 
     assert result.board.at(7, 7) is Stone.BLACK
+
+
+def test_recognizes_white_stone_with_colored_last_move_marker() -> None:
+    frame, profile = _synthetic_board()
+    cv2.circle(frame, (8 * 60, 7 * 60), 10, (0, 140, 255), -1)
+
+    result = recognize_frame(frame, profile)
+
+    assert result.board.at(8, 7) is Stone.WHITE
+
+
+def test_ignores_small_blue_board_star_points() -> None:
+    frame, profile = _blue_board_with_stars()
+    cv2.circle(frame, (7 * 60, 7 * 60), 25, (20, 20, 20), -1)
+    cv2.circle(frame, (8 * 60, 7 * 60), 25, (250, 250, 250), -1)
+
+    result = recognize_frame(frame, profile)
+
+    assert result.board.at(7, 7) is Stone.BLACK
+    assert result.board.at(8, 7) is Stone.WHITE
+    assert result.board.counts() == (1, 1)
+    assert all(result.board.at(x, y) is Stone.EMPTY for x, y in ((3, 3), (11, 3), (3, 11), (11, 11)))
+    assert result.confidence >= 0.70
+
+
+def test_detects_large_banner_covering_board() -> None:
+    frame, profile = _synthetic_board()
+    cv2.rectangle(frame, (135, 580), (710, 665), (20, 20, 20), -1)
+    cv2.putText(
+        frame,
+        "Disconnected",
+        (220, 635),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (250, 250, 250),
+        2,
+        cv2.LINE_AA,
+    )
+
+    result = recognize_frame(frame, profile)
+
+    assert result.obstruction_reason == "board is covered by a popup or banner"
 
 
 def test_rejects_non_board_image() -> None:
@@ -106,6 +164,24 @@ def test_state_tracker_requires_stable_frames() -> None:
     assert second is None
     assert third is not None
     assert transition.valid
+
+
+def test_state_tracker_pauses_for_banner_then_recovers() -> None:
+    frame, profile = _synthetic_board()
+    banner = frame.copy()
+    cv2.rectangle(banner, (135, 580), (710, 665), (20, 20, 20), -1)
+    tracker = StableStateTracker(required_frames=2)
+
+    blocked, committed = tracker.observe(recognize_frame(banner, profile))
+    _, first_clear = tracker.observe(recognize_frame(frame, profile))
+    recovered, second_clear = tracker.observe(recognize_frame(frame, profile))
+
+    assert not blocked.valid
+    assert "covered" in blocked.reason
+    assert committed is None
+    assert first_clear is None
+    assert recovered.valid
+    assert second_clear is not None
 
 
 def test_state_tracker_rejects_menu_without_board_grid() -> None:

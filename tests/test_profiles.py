@@ -52,6 +52,8 @@ def test_profile_preserves_grid_score_baseline() -> None:
         board_size=15,
         corners=((0, 0), (840, 0), (840, 840), (0, 840)),
         grid_score_baseline=0.12,
+        black_disk_fraction_min=0.61,
+        white_disk_fraction_min=0.57,
     )
 
     restored = BoardProfile.from_dict(profile.to_dict())

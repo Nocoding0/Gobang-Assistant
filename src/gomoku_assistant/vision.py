@@ -27,6 +27,8 @@ class BoardProfile:
     white_gray_min: float = 182.0
     white_fraction_min: float = 0.42
     white_saturation_max: float = 65.0
+    black_disk_fraction_min: float = 0.55
+    white_disk_fraction_min: float = 0.50
 
     def __post_init__(self) -> None:
         if self.board_size != 15:
@@ -35,6 +37,10 @@ class BoardProfile:
             raise ValueError("A profile requires exactly four corners.")
         if self.warp_size % (self.board_size - 1) != 0:
             raise ValueError("Warp size must divide evenly into grid intervals.")
+        if not 0 < self.black_disk_fraction_min <= 1:
+            raise ValueError("Black disk coverage must be between 0 and 1.")
+        if not 0 < self.white_disk_fraction_min <= 1:
+            raise ValueError("White disk coverage must be between 0 and 1.")
 
     @property
     def spacing(self) -> float:
@@ -55,6 +61,8 @@ class BoardProfile:
             "white_gray_min": self.white_gray_min,
             "white_fraction_min": self.white_fraction_min,
             "white_saturation_max": self.white_saturation_max,
+            "black_disk_fraction_min": self.black_disk_fraction_min,
+            "white_disk_fraction_min": self.white_disk_fraction_min,
         }
 
     @classmethod
@@ -83,6 +91,8 @@ class BoardProfile:
             white_gray_min=float(data.get("white_gray_min", 182.0)),
             white_fraction_min=float(data.get("white_fraction_min", 0.42)),
             white_saturation_max=float(data.get("white_saturation_max", 65.0)),
+            black_disk_fraction_min=float(data.get("black_disk_fraction_min", 0.55)),
+            white_disk_fraction_min=float(data.get("white_disk_fraction_min", 0.50)),
         )
 
     def matches_source_shape(
@@ -116,6 +126,7 @@ class RecognitionResult:
     board_visible: bool
     grid_score: float
     warped: np.ndarray = field(repr=False, compare=False)
+    obstruction_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +227,7 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
     grid_assessment = assess_grid(warped, spacing, profile.board_size)
     grid_score = grid_assessment.score
     board_visible = grid_score >= profile.grid_visibility_threshold
+    obstruction_reason = assess_obstruction(warped, spacing, profile)
     radius = max(int(spacing * 0.36), 7)
     inner_radius = max(int(spacing * 0.16), 3)
     stone_radius = max(int(spacing * 0.30), 6)
@@ -231,7 +243,8 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
             )
             inner_mask = distances <= inner_radius**2
             outer_mask = (distances >= inner_radius**2) & (distances <= stone_radius**2)
-            if not np.any(outer_mask):
+            disk_mask = distances <= stone_radius**2
+            if not np.any(outer_mask) or not np.any(disk_mask):
                 cells.append(Stone.EMPTY)
                 confidences.append(0.0)
                 continue
@@ -244,37 +257,35 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
             dark_outer = float(np.mean(dark_mask[outer_mask]))
             white_inner = float(np.mean(white_mask[inner_mask])) if np.any(inner_mask) else 0.0
             white_outer = float(np.mean(white_mask[outer_mask]))
-            black_round = _centered_round_mask(dark_mask & (distances <= stone_radius**2))
-            white_round = _centered_round_mask(white_mask & (distances <= stone_radius**2))
+            dark_disk = float(np.mean(dark_mask[disk_mask]))
+            white_disk = float(np.mean(white_mask[disk_mask]))
+            black_round = _centered_round_mask(dark_mask & disk_mask)
+            white_round = _centered_round_mask(white_mask & disk_mask)
+            black_strength = (
+                dark_disk / profile.black_disk_fraction_min if black_round else 0.0
+            )
+            white_strength = (
+                white_disk / profile.white_disk_fraction_min if white_round else 0.0
+            )
 
             # The outer ring keeps black stones detectable when the game draws a
             # colored last-move marker in the center.
-            if (dark_inner >= profile.black_fraction_min or dark_outer >= 0.28) and black_round:
+            if (
+                (dark_inner >= profile.black_fraction_min or dark_outer >= 0.28)
+                and black_strength >= 1.0
+            ):
                 cells.append(Stone.BLACK)
-                confidences.append(
-                    min(1.0, max(dark_inner / profile.black_fraction_min, dark_outer / 0.28))
-                )
+                confidences.append(min(1.0, black_strength))
             elif (
                 white_inner >= profile.white_fraction_min
                 or white_outer >= 0.36
-            ) and white_round:
+            ) and white_strength >= 1.0:
                 cells.append(Stone.WHITE)
-                confidences.append(
-                    min(1.0, max(white_inner / profile.white_fraction_min, white_outer / 0.36))
-                )
+                confidences.append(min(1.0, white_strength))
             else:
                 cells.append(Stone.EMPTY)
-                confidence = max(
-                    0.0,
-                    1.0
-                    - max(
-                        dark_inner / profile.black_fraction_min,
-                        dark_outer / 0.28,
-                        white_inner / profile.white_fraction_min,
-                        white_outer / 0.36,
-                    ),
-                )
-                confidences.append(confidence)
+                candidate_strength = min(1.0, max(black_strength, white_strength))
+                confidences.append(1.0 - candidate_strength**2)
 
     return RecognitionResult(
         board=BoardState(size=profile.board_size, cells=tuple(cells)),
@@ -283,6 +294,7 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
         board_visible=board_visible,
         grid_score=grid_score,
         warped=warped,
+        obstruction_reason=obstruction_reason,
     )
 
 
@@ -317,6 +329,47 @@ def _centered_round_mask(mask: np.ndarray) -> bool:
     angles = np.arctan2(ys - center_y, xs - center_x)
     sectors = np.unique(np.floor((angles + np.pi) / (2 * np.pi) * 8).astype(int))
     return len(sectors) >= 5
+
+
+def assess_obstruction(
+    warped_bgr: np.ndarray, spacing: float, profile: BoardProfile
+) -> str | None:
+    """Return a reason when a banner or dialog blocks a substantial board area."""
+
+    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
+    kernel_size = max(5, round(spacing * 0.15))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+    dark = (gray <= min(profile.black_gray_max, 60)).astype(np.uint8) * 255
+    light = (
+        (gray >= max(profile.white_gray_min, 205))
+        & (hsv[..., 1] <= profile.white_saturation_max)
+    ).astype(np.uint8) * 255
+    for mask in (dark, light):
+        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        if _has_large_obstruction(opened, spacing):
+            return "board is covered by a popup or banner"
+    return None
+
+
+def _has_large_obstruction(mask: np.ndarray, spacing: float) -> bool:
+    component_count, _, statistics, _ = cv2.connectedComponentsWithStats(mask)
+    minimum_width = spacing * 3.0
+    minimum_height = spacing * 0.55
+    minimum_area = spacing**2 * 1.2
+    for left, top, width, height, area in statistics[1:component_count]:
+        del left, top
+        if (
+            width >= minimum_width
+            and height >= minimum_height
+            and area >= minimum_area
+        ):
+            return True
+    return False
 
 
 def assess_grid(
@@ -408,6 +461,10 @@ class StableStateTracker:
         self.committed = None
 
     def observe(self, result: RecognitionResult) -> tuple[TransitionResult, BoardState | None]:
+        if result.obstruction_reason is not None:
+            self._samples.clear()
+            self._reset_samples.clear()
+            return TransitionResult(False, False, result.obstruction_reason), None
         if not result.board_visible:
             self._samples.clear()
             self._reset_samples.clear()

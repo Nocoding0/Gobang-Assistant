@@ -787,16 +787,19 @@ class MainWindow(QMainWindow):
                 )
         elif not transition.valid:
             self._overlay.hide()
-            black, white = recognition.board.counts()
-            self._status.setText(
-                f"Not synced: {transition.reason}; grid {recognition.grid_score:.0%}; "
-                f"detected B{black}/W{white}."
-            )
+            if recognition.obstruction_reason is not None:
+                self._status.setText("Paused: board is covered; waiting for a clear frame.")
+            else:
+                black, white = recognition.board.counts()
+                self._status.setText(
+                    f"Not synced: {transition.reason}; grid {recognition.grid_score:.0%}; "
+                    f"confidence {recognition.confidence:.0%}; detected B{black}/W{white}."
+                )
         else:
             black, white = recognition.board.counts()
             self._status.setText(
-                f"Watching: grid {recognition.grid_score:.0%}; detected B{black}/W{white}; "
-                f"{transition.reason}."
+                f"Watching: grid {recognition.grid_score:.0%}; confidence "
+                f"{recognition.confidence:.0%}; detected B{black}/W{white}; {transition.reason}."
             )
 
     def _should_analyze_turn(self, board: BoardState) -> bool:
