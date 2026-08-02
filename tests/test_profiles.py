@@ -54,6 +54,8 @@ def test_profile_preserves_grid_score_baseline() -> None:
         grid_score_baseline=0.12,
         black_disk_fraction_min=0.61,
         white_disk_fraction_min=0.57,
+        black_saturation_max=71.0,
+        black_low_saturation_fraction_min=0.63,
     )
 
     restored = BoardProfile.from_dict(profile.to_dict())

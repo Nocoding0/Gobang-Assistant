@@ -72,3 +72,23 @@ def test_switching_to_white_while_observing_resynchronizes_board() -> None:
     assert window._tracker.committed is None
     assert "Resynchronizing" in window._status.text()
     window.close()
+
+
+def test_resync_keeps_last_confirmed_board_while_observing() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    window._board = board
+    window._board_canvas.set_board(board)
+    window._tracker.committed = board
+    window._observe_button.blockSignals(True)
+    window._observe_button.setChecked(True)
+    window._observe_button.blockSignals(False)
+
+    window.clear_board()
+
+    assert application is not None
+    assert window._board == board
+    assert window._tracker.committed is None
+    assert "Resynchronizing" in window._status.text()
+    window.close()

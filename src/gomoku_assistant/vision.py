@@ -10,6 +10,20 @@ from .domain import BoardState, Stone, TransitionResult, validate_transition
 
 
 DEFAULT_WARP_SIZE = 840
+MARKER_HUE_MIN = 5
+MARKER_HUE_MAX = 30
+MARKER_SATURATION_MIN = 100
+MARKER_VALUE_MIN = 120
+MARKER_INNER_FRACTION_MIN = 0.20
+MARKER_BLACK_OUTER_MIN = 0.45
+MARKER_BLACK_DISK_MIN = 0.38
+MARKER_BLACK_LOW_SATURATION_MIN = 0.50
+EDGE_BLACK_INNER_MIN = 0.70
+EDGE_BLACK_OUTER_MIN = 0.50
+EDGE_BLACK_DISK_MIN = 0.72
+EDGE_WHITE_INNER_MIN = 0.70
+EDGE_WHITE_OUTER_MIN = 0.60
+EDGE_WHITE_DISK_MIN = 0.72
 
 
 @dataclass(frozen=True)
@@ -29,6 +43,8 @@ class BoardProfile:
     white_saturation_max: float = 65.0
     black_disk_fraction_min: float = 0.55
     white_disk_fraction_min: float = 0.50
+    black_saturation_max: float = 65.0
+    black_low_saturation_fraction_min: float = 0.55
 
     def __post_init__(self) -> None:
         if self.board_size != 15:
@@ -41,6 +57,10 @@ class BoardProfile:
             raise ValueError("Black disk coverage must be between 0 and 1.")
         if not 0 < self.white_disk_fraction_min <= 1:
             raise ValueError("White disk coverage must be between 0 and 1.")
+        if not 0 <= self.black_saturation_max <= 255:
+            raise ValueError("Black saturation maximum must be between 0 and 255.")
+        if not 0 < self.black_low_saturation_fraction_min <= 1:
+            raise ValueError("Black low-saturation coverage must be between 0 and 1.")
 
     @property
     def spacing(self) -> float:
@@ -63,6 +83,8 @@ class BoardProfile:
             "white_saturation_max": self.white_saturation_max,
             "black_disk_fraction_min": self.black_disk_fraction_min,
             "white_disk_fraction_min": self.white_disk_fraction_min,
+            "black_saturation_max": self.black_saturation_max,
+            "black_low_saturation_fraction_min": self.black_low_saturation_fraction_min,
         }
 
     @classmethod
@@ -93,6 +115,10 @@ class BoardProfile:
             white_saturation_max=float(data.get("white_saturation_max", 65.0)),
             black_disk_fraction_min=float(data.get("black_disk_fraction_min", 0.55)),
             white_disk_fraction_min=float(data.get("white_disk_fraction_min", 0.50)),
+            black_saturation_max=float(data.get("black_saturation_max", 65.0)),
+            black_low_saturation_fraction_min=float(
+                data.get("black_low_saturation_fraction_min", 0.55)
+            ),
         )
 
     def matches_source_shape(
@@ -253,33 +279,87 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
             white_mask = (gray_patch >= profile.white_gray_min) & (
                 hsv_patch[..., 1] <= profile.white_saturation_max
             )
+            marker_mask = (
+                (hsv_patch[..., 0] >= MARKER_HUE_MIN)
+                & (hsv_patch[..., 0] <= MARKER_HUE_MAX)
+                & (hsv_patch[..., 1] >= MARKER_SATURATION_MIN)
+                & (hsv_patch[..., 2] >= MARKER_VALUE_MIN)
+            )
             dark_inner = float(np.mean(dark_mask[inner_mask])) if np.any(inner_mask) else 0.0
             dark_outer = float(np.mean(dark_mask[outer_mask]))
             white_inner = float(np.mean(white_mask[inner_mask])) if np.any(inner_mask) else 0.0
             white_outer = float(np.mean(white_mask[outer_mask]))
             dark_disk = float(np.mean(dark_mask[disk_mask]))
             white_disk = float(np.mean(white_mask[disk_mask]))
+            marker_inner = float(np.mean(marker_mask[inner_mask])) if np.any(inner_mask) else 0.0
             black_round = _centered_round_mask(dark_mask & disk_mask)
             white_round = _centered_round_mask(white_mask & disk_mask)
-            black_strength = (
-                dark_disk / profile.black_disk_fraction_min if black_round else 0.0
+            dark_pixels = dark_mask & disk_mask
+            dark_low_saturation = (
+                float(np.mean(hsv_patch[..., 1][dark_pixels] <= profile.black_saturation_max))
+                if np.any(dark_pixels)
+                else 0.0
             )
-            white_strength = (
+            is_edge = x in (0, profile.board_size - 1) or y in (0, profile.board_size - 1)
+            marker_black_strength = min(
+                marker_inner / MARKER_INNER_FRACTION_MIN,
+                dark_outer / MARKER_BLACK_OUTER_MIN,
+                dark_disk / MARKER_BLACK_DISK_MIN,
+                dark_low_saturation / MARKER_BLACK_LOW_SATURATION_MIN,
+            )
+            marker_black = marker_black_strength >= 1.0
+            edge_black_strength = min(
+                dark_inner / EDGE_BLACK_INNER_MIN,
+                dark_outer / EDGE_BLACK_OUTER_MIN,
+                dark_disk / EDGE_BLACK_DISK_MIN,
+                dark_low_saturation / profile.black_low_saturation_fraction_min,
+            )
+            edge_white_strength = min(
+                white_inner / EDGE_WHITE_INNER_MIN,
+                white_outer / EDGE_WHITE_OUTER_MIN,
+                white_disk / EDGE_WHITE_DISK_MIN,
+            )
+            normal_black_strength = (
+                min(
+                    dark_disk / profile.black_disk_fraction_min,
+                    dark_low_saturation / profile.black_low_saturation_fraction_min,
+                )
+                if black_round
+                else 0.0
+            )
+            normal_white_strength = (
                 white_disk / profile.white_disk_fraction_min if white_round else 0.0
             )
 
-            # The outer ring keeps black stones detectable when the game draws a
-            # colored last-move marker in the center.
-            if (
-                (dark_inner >= profile.black_fraction_min or dark_outer >= 0.28)
-                and black_strength >= 1.0
-            ):
+            if is_edge:
+                black_detected = edge_black_strength >= 1.0 or marker_black
+                white_detected = edge_white_strength >= 1.0
+                black_strength = max(edge_black_strength, marker_black_strength)
+                white_strength = edge_white_strength
+            else:
+                black_detected = (
+                    black_round
+                    and dark_low_saturation >= profile.black_low_saturation_fraction_min
+                    and (
+                        (
+                            dark_inner >= profile.black_fraction_min
+                            or dark_outer >= 0.28
+                        )
+                        and normal_black_strength >= 1.0
+                        or marker_black
+                    )
+                )
+                white_detected = (
+                    (white_inner >= profile.white_fraction_min or white_outer >= 0.36)
+                    and normal_white_strength >= 1.0
+                )
+                black_strength = max(normal_black_strength, marker_black_strength)
+                white_strength = normal_white_strength
+
+            if black_detected:
                 cells.append(Stone.BLACK)
                 confidences.append(min(1.0, black_strength))
-            elif (
-                white_inner >= profile.white_fraction_min
-                or white_outer >= 0.36
-            ) and white_strength >= 1.0:
+            elif white_detected:
                 cells.append(Stone.WHITE)
                 confidences.append(min(1.0, white_strength))
             else:

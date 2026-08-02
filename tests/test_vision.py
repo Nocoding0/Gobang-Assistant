@@ -42,6 +42,13 @@ def _blue_board_with_stars() -> tuple[np.ndarray, BoardProfile]:
     return canvas, profile
 
 
+def _blue_board_with_border_decorations() -> tuple[np.ndarray, BoardProfile]:
+    canvas, profile = _blue_board_with_stars()
+    for x in (12, 13):
+        cv2.circle(canvas, (x * 60, 0), 25, (125, 30, 45), -1)
+    return canvas, profile
+
+
 def test_recognizes_synthetic_black_and_white_stones() -> None:
     frame, profile = _synthetic_board()
 
@@ -64,6 +71,19 @@ def test_recognizes_black_stone_with_colored_last_move_marker() -> None:
     assert result.board.at(7, 7) is Stone.BLACK
 
 
+def test_recognizes_black_with_large_orange_marker_without_border_false_positive() -> None:
+    frame, profile = _blue_board_with_border_decorations()
+    cv2.circle(frame, (7 * 60, 7 * 60), 25, (20, 20, 20), -1)
+    cv2.circle(frame, (7 * 60, 7 * 60), 14, (0, 140, 255), -1)
+
+    result = recognize_frame(frame, profile)
+
+    assert result.board.counts() == (1, 0)
+    assert result.board.at(7, 7) is Stone.BLACK
+    assert result.board.at(12, 0) is Stone.EMPTY
+    assert result.board.at(13, 0) is Stone.EMPTY
+
+
 def test_recognizes_white_stone_with_colored_last_move_marker() -> None:
     frame, profile = _synthetic_board()
     cv2.circle(frame, (8 * 60, 7 * 60), 10, (0, 140, 255), -1)
@@ -71,6 +91,19 @@ def test_recognizes_white_stone_with_colored_last_move_marker() -> None:
     result = recognize_frame(frame, profile)
 
     assert result.board.at(8, 7) is Stone.WHITE
+
+
+def test_recognizes_half_stones_on_board_edges() -> None:
+    frame, profile = _blue_board_with_border_decorations()
+    cv2.circle(frame, (14 * 60, 6 * 60), 25, (20, 20, 20), -1)
+    cv2.circle(frame, (0, 8 * 60), 25, (250, 250, 250), -1)
+
+    result = recognize_frame(frame, profile)
+
+    assert result.board.at(14, 6) is Stone.BLACK
+    assert result.board.at(0, 8) is Stone.WHITE
+    assert result.board.at(12, 0) is Stone.EMPTY
+    assert result.board.at(13, 0) is Stone.EMPTY
 
 
 def test_ignores_small_blue_board_star_points() -> None:

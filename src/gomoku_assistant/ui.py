@@ -753,6 +753,7 @@ class MainWindow(QMainWindow):
                 )
                 return
         self._observe_button.setText("Stop observing" if enabled else "Start observing")
+        self._clear_button.setText("Resync board" if enabled else "Clear board")
         if enabled:
             self._tracker.reset()
             self._set_board(BoardState.empty(), analyze=False)
@@ -800,9 +801,11 @@ class MainWindow(QMainWindow):
                 )
             else:
                 black, white = recognition.board.counts()
+                confirmed_black, confirmed_white = self._board.counts()
                 self._status.setText(
                     f"Not synced: {transition.reason}; grid {recognition.grid_score:.0%}; "
-                    f"confidence {recognition.confidence:.0%}; detected B{black}/W{white}."
+                    f"confidence {recognition.confidence:.0%}; detected B{black}/W{white}; "
+                    f"last confirmed B{confirmed_black}/W{confirmed_white}."
                 )
         else:
             black, white = recognition.board.counts()
@@ -847,6 +850,15 @@ class MainWindow(QMainWindow):
         self._overlay.hide()
 
     def clear_board(self) -> None:
+        if self._observe_button.isChecked():
+            self._tracker.reset()
+            self._invalidate_analysis()
+            black, white = self._board.counts()
+            self._candidate_text.setText(
+                f"Resynchronizing. Last confirmed board: B{black}/W{white}."
+            )
+            self._status.setText("Resynchronizing current board from stable frames.")
+            return
         self._tracker.reset()
         self._set_board(BoardState.empty(), analyze=False)
         self._candidate_text.setText("No analysis yet")
