@@ -56,6 +56,33 @@ def test_stale_analysis_result_does_not_replace_new_board() -> None:
     window.close()
 
 
+def test_suggestions_stay_inside_assistant_window() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    candidate = CandidateMove(
+        x=8,
+        y=7,
+        rank=1,
+        score=100,
+        proof=ProofStatus.HEURISTIC,
+    )
+
+    window._board = board
+    window._board_canvas.set_board(board)
+    window._analysis_version = 1
+    window._on_analysis_ready(
+        1,
+        AnalysisResult(board=board, candidates=(candidate,), engine_name="Rapfi"),
+    )
+
+    assert application is not None
+    assert not hasattr(window, "_overlay")
+    assert not hasattr(window, "_overlay_toggle")
+    assert window._candidates == (candidate,)
+    window.close()
+
+
 def test_switching_to_white_while_observing_resynchronizes_board() -> None:
     application = QApplication.instance() or QApplication([])
     window = MainWindow()

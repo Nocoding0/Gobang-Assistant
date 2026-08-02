@@ -8,11 +8,10 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRect, QRectF, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -50,7 +49,6 @@ from .sessions import SessionLogger
 from .vision import (
     BoardProfile,
     StableStateTracker,
-    grid_points_in_source,
     is_valid_board_quadrilateral,
     order_corners,
     recognize_frame,
@@ -361,57 +359,6 @@ class CalibrationDialog(QDialog):
         return replace(profile, grid_score_baseline=baseline)
 
 
-class SuggestionOverlay(QWidget):
-    def __init__(self) -> None:
-        flags = (
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowTransparentForInput
-        )
-        super().__init__(None, flags)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self._markers: list[tuple[float, float, CandidateMove]] = []
-
-    def update_markers(
-        self,
-        window: WindowInfo,
-        frame_shape: tuple[int, int],
-        profile: BoardProfile,
-        candidates: tuple[CandidateMove, ...],
-    ) -> None:
-        frame_height, frame_width = frame_shape
-        source_points = grid_points_in_source(profile)
-        markers: list[tuple[float, float, CandidateMove]] = []
-        for candidate in candidates:
-            index = candidate.y * profile.board_size + candidate.x
-            source_x, source_y = source_points[index]
-            markers.append((source_x / frame_width, source_y / frame_height, candidate))
-        self._markers = markers
-        self.setGeometry(QRect(window.left, window.top, window.width, window.height))
-        self.update()
-
-    def paintEvent(self, _: Any) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        radius = max(min(self.width(), self.height()) * 0.022, 14)
-        for normalized_x, normalized_y, candidate in self._markers:
-            center = QPointF(normalized_x * self.width(), normalized_y * self.height())
-            color = MARKER_COLORS[min(candidate.rank - 1, len(MARKER_COLORS) - 1)]
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(color, 4))
-            painter.drawEllipse(center, radius, radius)
-            painter.setBrush(color)
-            painter.setPen(QPen(QColor("#ffffff"), 1))
-            painter.drawText(
-                QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2),
-                Qt.AlignmentFlag.AlignCenter,
-                str(candidate.rank),
-            )
-
-
 class MainWindow(QMainWindow):
     analysis_ready = Signal(int, object)
 
@@ -427,7 +374,6 @@ class MainWindow(QMainWindow):
         self._last_window: WindowInfo | None = None
         self._capture_session = WindowCaptureSession()
         self._tracker = StableStateTracker()
-        self._overlay = SuggestionOverlay()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._analysis_version = 0
         self._session = SessionLogger(Path.cwd() / "sessions")
@@ -478,9 +424,6 @@ class MainWindow(QMainWindow):
         self._my_color.addItem("White", Stone.WHITE)
         self._my_color.addItem("Analyze both colors", "both")
         self._my_color.currentIndexChanged.connect(self._on_my_color_changed)
-        self._overlay_toggle = QCheckBox("Show transparent overlay")
-        self._overlay_toggle.setChecked(True)
-        self._overlay_toggle.toggled.connect(self._refresh_overlay)
 
         self._profile_status = QLabel(self._profile_status_text())
         self._engine_status = QLabel(self._engine_status_text())
@@ -511,7 +454,6 @@ class MainWindow(QMainWindow):
         controls.addRow("Engine", self._engine_status)
         controls.addRow("", self._analyze_button)
         controls.addRow("", self._clear_button)
-        controls.addRow("", self._overlay_toggle)
 
         suggestion_group = QGroupBox("Suggestions")
         suggestion_layout = QVBoxLayout(suggestion_group)
@@ -847,7 +789,6 @@ class MainWindow(QMainWindow):
         self._analysis_version += 1
         self._candidates = ()
         self._board_canvas.set_candidates(())
-        self._overlay.hide()
 
     def clear_board(self) -> None:
         if self._observe_button.isChecked():
@@ -890,7 +831,6 @@ class MainWindow(QMainWindow):
             self._candidate_text.setText(
                 "Game over: " + ("Black wins." if winner is Stone.BLACK else "White wins." if winner else "Draw.")
             )
-            self._overlay.hide()
             return
 
         board = self._board
@@ -946,7 +886,6 @@ class MainWindow(QMainWindow):
             + f"\nEngine: {result.engine_name}"
         )
         self._status.setText(f"Analysis ready from {result.engine_name}.")
-        self._refresh_overlay()
 
     @staticmethod
     def _candidate_label(move: CandidateMove, result: AnalysisResult) -> str:
@@ -956,32 +895,9 @@ class MainWindow(QMainWindow):
             return "local alternative"
         return "engine choice" if move.score is None else f"score {move.score:+d}"
 
-    def _refresh_overlay(self) -> None:
-        if (
-            not self._overlay_toggle.isChecked()
-            or not self._candidates
-            or self._profile is None
-            or self._last_frame is None
-        ):
-            self._overlay.hide()
-            return
-        handle = self._selected_handle()
-        window = get_window_info(handle) if handle is not None else self._last_window
-        if window is None:
-            self._overlay.hide()
-            return
-        self._overlay.update_markers(
-            window,
-            self._last_frame.shape[:2],
-            self._profile,
-            self._candidates,
-        )
-        self._overlay.show()
-
     def closeEvent(self, event: Any) -> None:
         self._capture_timer.stop()
         self._capture_session.stop()
-        self._overlay.hide()
         target = self._session.save()
         if self._rapfi_analyzer is not None:
             self._rapfi_analyzer.close()

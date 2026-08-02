@@ -1,14 +1,14 @@
 ﻿# 五子棋训练助手 / Gomoku Training Assistant
 
-这是一个在 Windows 上运行的本地五子棋训练工具。它读取你选择的游戏窗口或截图，识别 `15 x 15` 棋盘上的黑白棋，调用本地 Rapfi 引擎，并把建议落点显示在应用棋盘和可选透明提示层上。
+这是一个在 Windows 上运行的本地五子棋训练工具。它读取你选择的游戏窗口或截图，识别 `15 x 15` 棋盘上的黑白棋，调用本地 Rapfi 引擎，并把建议落点显示在助手的棋盘上。
 
-This is a local Windows Gomoku training tool. It reads a selected game window or screenshot, recognizes black and white stones on a `15 x 15` board, calls the local Rapfi engine, and displays suggested moves on the app board and an optional transparent overlay.
+This is a local Windows Gomoku training tool. It reads a selected game window or screenshot, recognizes black and white stones on a `15 x 15` board, calls the local Rapfi engine, and displays suggested moves on the assistant board.
 
 ## 当前状态 / Current Status
 
-当前项目是**可运行的 MVP**，已经具备：手工摆局、截图四角校准、Windows 窗口观察、局面合法性检查、Rapfi 引擎分析、透明提示层和本地复盘记录。
+当前项目是**可运行的 MVP**，已经具备：手工摆局、截图四角校准、Windows 窗口观察、局面合法性检查、Rapfi 引擎分析和本地复盘记录。
 
-The project is a **runnable MVP**. It includes manual board editing, four-corner screenshot calibration, Windows window observation, legal-state checks, Rapfi analysis, a transparent overlay, and local replay logs.
+The project is a **runnable MVP**. It includes manual board editing, four-corner screenshot calibration, Windows window observation, legal-state checks, Rapfi analysis, and local replay logs.
 
 它还不是“打开任意五子棋页面就完全自动识别”的最终产品。第一版只针对一个经过校准的微信、浏览器或桌面客户端棋盘皮肤；换窗口大小、缩放比例或主题后，通常需要重新校准。
 
@@ -49,8 +49,8 @@ After the application opens, follow these steps:
    Choose Black, White, or Analyze both colors under `My color`, then click
    `Start observing`. The app waits for three matching frames, verifies turn
    order, and catches up when multiple moves appear between samples.
-6. 识别到新局面后，红色 `1` 是 Rapfi 的首选。其余两个候选由本地战术算法补充；勾选 `Show transparent overlay` 后，标记会覆盖在目标窗口上。
-   After a new position is recognized, red `1` is Rapfi's preferred move. The other two moves are local tactical alternatives. Enable `Show transparent overlay` to draw markers over the target window.
+6. 识别到新局面后，助手中央棋盘上的红色 `1` 是 Rapfi 的首选。其余两个候选由本地战术算法补充。
+   After a new position is recognized, red `1` on the assistant's central board is Rapfi's preferred move. The other two moves are local tactical alternatives.
 
 如果只想先测试棋力，不需要窗口识别：直接在左侧棋盘点击摆子，然后点击 `Analyze position`。
 
@@ -83,11 +83,11 @@ To test the engine without screen recognition, place stones on the left board an
 
 数据按以下路径流动：
 
-`游戏窗口或截图 -> 棋盘识别 -> 合法局面确认 -> Rapfi 分析 -> 棋盘和透明层提示`
+`游戏窗口或截图 -> 棋盘识别 -> 合法局面确认 -> Rapfi 分析 -> 助手棋盘提示`
 
 Data flows through:
 
-`game window or screenshot -> board recognition -> legal-state confirmation -> Rapfi analysis -> board and overlay hint`
+`game window or screenshot -> board recognition -> legal-state confirmation -> Rapfi analysis -> assistant board hint`
 
 1. **采集层 / Capture**
    Qt 从你选择的 Windows 窗口读取画面，也可以加载本地截图。程序只读取像素，不向目标窗口发送鼠标或键盘操作。
@@ -113,9 +113,9 @@ Data flows through:
    Rapfi runs as a local process and searches the best move. The bundled version reliably returns one best move; the app uses a local tactical algorithm for second and third alternatives, without presenting them as exact Rapfi scores.
 
 5. **显示与记录层 / Display and Logging**
-   左侧棋盘显示当前局面和候选。透明提示层可映射回目标窗口；关闭程序时会把分析记录保存到 `sessions/`，可用于复盘。
+   助手棋盘显示当前局面和候选。关闭程序时会把分析记录保存到 `sessions/`，可用于复盘。
 
-   The left board shows the current position and suggestions. The transparent overlay maps them back to the target window. Analysis records are saved to `sessions/` when the app closes.
+   The assistant board shows the current position and suggestions. Analysis records are saved to `sessions/` when the app closes.
 
 ## Rapfi 引擎 / Rapfi Engine
 
