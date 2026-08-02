@@ -6,6 +6,7 @@ from gomoku_assistant.vision import (
     BoardProfile,
     RecognitionResult,
     StableStateTracker,
+    is_valid_board_quadrilateral,
     recognize_frame,
 )
 
@@ -57,6 +58,39 @@ def test_rejects_non_board_image() -> None:
     result = recognize_frame(frame, profile)
 
     assert not result.board_visible
+
+
+def test_low_contrast_blue_grid_uses_calibration_baseline() -> None:
+    edge = 840
+    frame = np.full((edge + 1, edge + 1, 3), (188, 178, 150), dtype=np.uint8)
+    for coordinate in range(0, edge + 1, 60):
+        cv2.line(frame, (coordinate, 0), (coordinate, edge), (195, 168, 138), 1)
+        cv2.line(frame, (0, coordinate), (edge, coordinate), (195, 168, 138), 1)
+
+    corners = ((0, 0), (edge, 0), (edge, edge), (0, edge))
+    uncalibrated = BoardProfile(board_size=15, corners=corners)
+    raw = recognize_frame(frame, uncalibrated)
+    calibrated = BoardProfile(
+        board_size=15,
+        corners=corners,
+        grid_score_baseline=raw.grid_score,
+    )
+    result = recognize_frame(frame, calibrated)
+
+    assert 0.08 <= raw.grid_score < 0.35
+    assert result.board_visible
+    assert calibrated.grid_visibility_threshold < 0.35
+
+
+def test_calibration_requires_a_valid_board_quadrilateral() -> None:
+    assert is_valid_board_quadrilateral(
+        ((100, 120), (700, 100), (720, 710), (80, 730)),
+        (840, 840, 3),
+    )
+    assert not is_valid_board_quadrilateral(
+        ((100, 100), (700, 100), (700, 110), (100, 110)),
+        (840, 840, 3),
+    )
 
 
 def test_state_tracker_requires_stable_frames() -> None:

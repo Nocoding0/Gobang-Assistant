@@ -47,7 +47,14 @@ from .domain import BoardState, Stone
 from .engine import RapfiAnalyzer, RapfiConfig
 from .profiles import ProfileStore
 from .sessions import SessionLogger
-from .vision import BoardProfile, StableStateTracker, grid_points_in_source, order_corners, recognize_frame
+from .vision import (
+    BoardProfile,
+    StableStateTracker,
+    grid_points_in_source,
+    is_valid_board_quadrilateral,
+    order_corners,
+    recognize_frame,
+)
 
 
 MARKER_COLORS = (QColor("#c73b33"), QColor("#c88810"), QColor("#167e79"))
@@ -290,6 +297,7 @@ class CalibrationDialog(QDialog):
     def __init__(self, frame: np.ndarray, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Calibrate 15x15 board")
+        self._frame = frame
         self._canvas = CalibrationCanvas(frame, self)
         self._hint = QLabel("Click top-left, top-right, bottom-right, then bottom-left intersections.")
         self._count = QLabel("0 / 4")
@@ -318,17 +326,26 @@ class CalibrationDialog(QDialog):
     def _on_points_changed(self, count: int) -> None:
         self._count.setText(f"{count} / 4")
         if count == 4:
-            profile = self.profile()
-            score = recognize_frame(self._frame, profile).grid_score
-            if score >= 0.35:
-                self._save_button.setEnabled(True)
-                self._hint.setText(
-                    f"Grid alignment {score:.0%}. Cyan points are on intersections; save calibration."
-                )
-            else:
+            if not is_valid_board_quadrilateral(self._canvas.points, self._frame.shape):
                 self._save_button.setEnabled(False)
                 self._hint.setText(
-                    f"Grid alignment {score:.0%}. Clear points and click the four outer intersections."
+                    "The four points do not form a valid board. Clear them and click the outer intersections."
+                )
+                return
+
+            score = self.profile().grid_score_baseline or 0.0
+            self._save_button.setEnabled(True)
+            if score >= 0.35:
+                self._hint.setText(
+                    f"Good grid signal {score:.0%}. Cyan points are on intersections; save calibration."
+                )
+            elif score >= 0.08:
+                self._hint.setText(
+                    f"Low-contrast grid signal {score:.0%}. If the cyan points align, save calibration."
+                )
+            else:
+                self._hint.setText(
+                    f"Very low grid signal {score:.0%}. The points may still be correct; save to test live sync."
                 )
         else:
             self._save_button.setEnabled(False)
@@ -339,7 +356,9 @@ class CalibrationDialog(QDialog):
     def profile(self) -> BoardProfile:
         if len(self._canvas.points) != 4:
             raise ValueError("Four calibration points are required.")
-        return BoardProfile(board_size=15, corners=order_corners(self._canvas.points))
+        profile = BoardProfile(board_size=15, corners=order_corners(self._canvas.points))
+        baseline = recognize_frame(self._frame, profile).grid_score
+        return replace(profile, grid_score_baseline=baseline)
 
 
 class SuggestionOverlay(QWidget):
@@ -537,7 +556,7 @@ class MainWindow(QMainWindow):
     def _profile_status_text(self) -> str:
         if self._profile is None:
             return "Not calibrated"
-        if self._profile.schema_version < 2:
+        if self._profile.schema_version < 3 or self._profile.grid_score_baseline is None:
             return "Legacy profile: recalibrate"
         if self._profile.source_width is None:
             return "Legacy profile: recalibrate"
@@ -695,12 +714,18 @@ class MainWindow(QMainWindow):
             self._observe_button.setChecked(False)
             QMessageBox.information(self, "Calibration required", "Calibrate the 15x15 board first.")
             return
-        if enabled and self._profile.schema_version < 2:
+        if (
+            enabled
+            and (
+                self._profile.schema_version < 3
+                or self._profile.grid_score_baseline is None
+            )
+        ):
             self._observe_button.setChecked(False)
             QMessageBox.information(
                 self,
                 "Recalibration required",
-                "This saved profile predates grid validation. Capture a frame and calibrate again.",
+                "This saved profile predates adaptive grid validation. Capture a frame and calibrate again.",
             )
             return
         if enabled and self._my_color.currentData() is None:

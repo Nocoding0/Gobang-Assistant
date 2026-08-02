@@ -16,11 +16,12 @@ DEFAULT_WARP_SIZE = 840
 class BoardProfile:
     board_size: int
     corners: tuple[tuple[float, float], ...]
-    schema_version: int = 2
+    schema_version: int = 3
     source_width: int | None = None
     source_height: int | None = None
     window_title: str | None = None
     warp_size: int = DEFAULT_WARP_SIZE
+    grid_score_baseline: float | None = None
     black_gray_max: float = 82.0
     black_fraction_min: float = 0.46
     white_gray_min: float = 182.0
@@ -48,6 +49,7 @@ class BoardProfile:
             "source_height": self.source_height,
             "window_title": self.window_title,
             "warp_size": self.warp_size,
+            "grid_score_baseline": self.grid_score_baseline,
             "black_gray_max": self.black_gray_max,
             "black_fraction_min": self.black_fraction_min,
             "white_gray_min": self.white_gray_min,
@@ -71,6 +73,11 @@ class BoardProfile:
                 str(data["window_title"]) if data.get("window_title") is not None else None
             ),
             warp_size=int(data.get("warp_size", DEFAULT_WARP_SIZE)),
+            grid_score_baseline=(
+                float(data["grid_score_baseline"])
+                if data.get("grid_score_baseline") is not None
+                else None
+            ),
             black_gray_max=float(data.get("black_gray_max", 82.0)),
             black_fraction_min=float(data.get("black_fraction_min", 0.46)),
             white_gray_min=float(data.get("white_gray_min", 182.0)),
@@ -92,6 +99,14 @@ class BoardProfile:
             frame_bgr.shape[1], frame_bgr.shape[0], window_title
         )
 
+    @property
+    def grid_visibility_threshold(self) -> float:
+        """Return the minimum signal expected for this calibrated board."""
+
+        if self.grid_score_baseline is None:
+            return 0.35
+        return max(0.08, min(0.85, self.grid_score_baseline * 0.45))
+
 
 @dataclass(frozen=True)
 class RecognitionResult:
@@ -101,6 +116,18 @@ class RecognitionResult:
     board_visible: bool
     grid_score: float
     warped: np.ndarray = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class GridAssessment:
+    """Grid-line signal measured in a perspective-normalized board image."""
+
+    vertical_score: float
+    horizontal_score: float
+
+    @property
+    def score(self) -> float:
+        return min(self.vertical_score, self.horizontal_score)
 
 
 def order_corners(points: Iterable[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
@@ -116,6 +143,38 @@ def order_corners(points: Iterable[tuple[float, float]]) -> tuple[tuple[float, f
     top_right = value[np.argmin(diffs)]
     bottom_left = value[np.argmax(diffs)]
     return tuple((float(point[0]), float(point[1])) for point in (top_left, top_right, bottom_right, bottom_left))
+
+
+def is_valid_board_quadrilateral(
+    points: Iterable[tuple[float, float]], frame_shape: tuple[int, ...]
+) -> bool:
+    """Validate that four clicks describe a usable board-sized quadrilateral."""
+
+    height, width = frame_shape[:2]
+    value = np.array(tuple(points), dtype=np.float32)
+    if value.shape != (4, 2):
+        return False
+    if (
+        np.any(value[:, 0] < 0)
+        or np.any(value[:, 0] >= width)
+        or np.any(value[:, 1] < 0)
+        or np.any(value[:, 1] >= height)
+    ):
+        return False
+
+    ordered = np.array(order_corners(value), dtype=np.float32)
+    if not cv2.isContourConvex(ordered.reshape(-1, 1, 2)):
+        return False
+    if cv2.contourArea(ordered) < width * height * 0.008:
+        return False
+
+    edges = np.linalg.norm(ordered - np.roll(ordered, -1, axis=0), axis=1)
+    if float(edges.min()) < 1.0 or float(edges.min() / edges.max()) < 0.20:
+        return False
+    return (
+        max(edges[0], edges[2]) / min(edges[0], edges[2]) <= 2.5
+        and max(edges[1], edges[3]) / min(edges[1], edges[3]) <= 2.5
+    )
 
 
 def warp_board(frame_bgr: np.ndarray, profile: BoardProfile) -> np.ndarray:
@@ -154,8 +213,9 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     spacing = profile.spacing
-    grid_score = _grid_score(gray, spacing, profile.board_size)
-    board_visible = grid_score >= 0.35
+    grid_assessment = assess_grid(warped, spacing, profile.board_size)
+    grid_score = grid_assessment.score
+    board_visible = grid_score >= profile.grid_visibility_threshold
     radius = max(int(spacing * 0.36), 7)
     inner_radius = max(int(spacing * 0.16), 3)
     stone_radius = max(int(spacing * 0.30), 6)
@@ -259,44 +319,69 @@ def _centered_round_mask(mask: np.ndarray) -> bool:
     return len(sectors) >= 5
 
 
-def _grid_score(gray: np.ndarray, spacing: float, board_size: int) -> float:
-    """Score expected grid-line contrast for a correctly calibrated board."""
+def assess_grid(
+    warped_bgr: np.ndarray, spacing: float, board_size: int
+) -> GridAssessment:
+    """Assess expected grid lines using Lab color separation and directional edges."""
 
-    contrasts: list[float] = []
+    lab = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    gradient_x = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gradient_y = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    vertical = _directional_grid_score(lab, gradient_x, spacing, board_size, axis=1)
+    horizontal = _directional_grid_score(lab, gradient_y, spacing, board_size, axis=0)
+    return GridAssessment(vertical_score=vertical, horizontal_score=horizontal)
+
+
+def _directional_grid_score(
+    lab: np.ndarray,
+    gradient: np.ndarray,
+    spacing: float,
+    board_size: int,
+    *,
+    axis: int,
+) -> float:
+    """Score one grid direction; axis 1 is vertical, axis 0 is horizontal."""
+
+    scores: list[float] = []
     line_half_width = max(1, round(spacing * 0.025))
     side_offset = max(3, round(spacing * 0.11))
     for index in range(board_size):
         point = round(index * spacing)
-        left = gray[
-            :,
-            max(0, point - side_offset - line_half_width) : max(
-                0, point - side_offset + line_half_width + 1
-            ),
-        ]
-        line = gray[:, max(0, point - line_half_width) : point + line_half_width + 1]
-        right = gray[
-            :,
-            point + side_offset - line_half_width : point + side_offset + line_half_width + 1,
-        ]
-        if left.size and line.size and right.size:
-            contrasts.append(float((left.mean() + right.mean()) / 2 - line.mean()))
+        before_start = point - side_offset - line_half_width
+        before_end = point - side_offset + line_half_width + 1
+        line_start = point - line_half_width
+        line_end = point + line_half_width + 1
+        after_start = point + side_offset - line_half_width
+        after_end = point + side_offset + line_half_width + 1
+        if before_start < 0 or after_end > lab.shape[axis]:
+            continue
 
-        top = gray[
-            max(0, point - side_offset - line_half_width) : max(
-                0, point - side_offset + line_half_width + 1
-            ),
-            :,
-        ]
-        line = gray[max(0, point - line_half_width) : point + line_half_width + 1, :]
-        bottom = gray[
-            point + side_offset - line_half_width : point + side_offset + line_half_width + 1,
-            :,
-        ]
-        if top.size and line.size and bottom.size:
-            contrasts.append(float((top.mean() + bottom.mean()) / 2 - line.mean()))
-    if not contrasts:
+        if axis == 1:
+            before_lab = lab[:, before_start:before_end]
+            line_lab = lab[:, line_start:line_end]
+            after_lab = lab[:, after_start:after_end]
+            line_gradient = gradient[:, max(0, line_start - 2) : min(
+                gradient.shape[1], line_end + 2
+            )]
+        else:
+            before_lab = lab[before_start:before_end, :]
+            line_lab = lab[line_start:line_end, :]
+            after_lab = lab[after_start:after_end, :]
+            line_gradient = gradient[max(0, line_start - 2) : min(
+                gradient.shape[0], line_end + 2
+            ), :]
+
+        if not (before_lab.size and line_lab.size and after_lab.size and line_gradient.size):
+            continue
+        side_color = (before_lab.mean(axis=(0, 1)) + after_lab.mean(axis=(0, 1))) / 2
+        line_color = line_lab.mean(axis=(0, 1))
+        color_score = min(float(np.linalg.norm(side_color - line_color)) / 18.0, 1.0)
+        edge_score = min(float(np.median(line_gradient)) / 16.0, 1.0)
+        scores.append(color_score * 0.65 + edge_score * 0.35)
+    if not scores:
         return 0.0
-    return float(np.clip(np.median(contrasts) / 18.0, 0.0, 1.0))
+    return float(np.median(scores))
 
 
 class StableStateTracker:

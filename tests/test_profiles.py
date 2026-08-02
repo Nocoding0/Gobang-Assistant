@@ -45,3 +45,16 @@ def test_profile_store_migrates_matching_legacy_default(tmp_path) -> None:
 
     assert loaded == legacy
     assert len(list(tmp_path.glob("profile-*.json"))) == 1
+
+
+def test_profile_preserves_grid_score_baseline() -> None:
+    profile = BoardProfile(
+        board_size=15,
+        corners=((0, 0), (840, 0), (840, 840), (0, 840)),
+        grid_score_baseline=0.12,
+    )
+
+    restored = BoardProfile.from_dict(profile.to_dict())
+
+    assert restored == profile
+    assert restored.grid_visibility_threshold == 0.08
