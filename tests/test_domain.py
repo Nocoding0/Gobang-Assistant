@@ -28,14 +28,16 @@ def test_legal_visual_transition_adds_expected_color() -> None:
     assert result.changed
 
 
-def test_visual_transition_rejects_two_changes() -> None:
+def test_visual_transition_catches_up_two_legal_changes() -> None:
     previous = BoardState.empty()
     current = previous.set_cell(7, 7, Stone.BLACK).set_cell(8, 7, Stone.WHITE)
 
     result = validate_transition(previous, current)
 
-    assert not result.valid
-    assert "more than one" in result.reason
+    assert result.valid
+    assert result.changed
+    assert result.added_count == 2
+    assert "caught up" in result.reason
 
 
 def test_visual_transition_rejects_wrong_color() -> None:
@@ -45,5 +47,32 @@ def test_visual_transition_rejects_wrong_color() -> None:
     result = validate_transition(previous, current)
 
     assert not result.valid
-    assert "wrong color" in result.reason
+    assert "turn order" in result.reason
 
+
+def test_visual_transition_rejects_bad_three_move_color_delta() -> None:
+    previous = BoardState.empty().place(7, 7, Stone.BLACK)
+    current = (
+        previous.set_cell(8, 7, Stone.BLACK)
+        .set_cell(9, 7, Stone.BLACK)
+        .set_cell(10, 7, Stone.WHITE)
+    )
+
+    result = validate_transition(previous, current)
+
+    assert not result.valid
+    assert "turn order" in result.reason
+
+
+def test_visual_transition_catches_up_three_legal_changes() -> None:
+    previous = BoardState.empty().place(7, 7, Stone.BLACK)
+    current = (
+        previous.set_cell(8, 7, Stone.WHITE)
+        .set_cell(9, 7, Stone.BLACK)
+        .set_cell(10, 7, Stone.WHITE)
+    )
+
+    result = validate_transition(previous, current)
+
+    assert result.valid
+    assert result.added_count == 3

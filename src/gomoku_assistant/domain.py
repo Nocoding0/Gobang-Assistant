@@ -143,6 +143,7 @@ class TransitionResult:
     valid: bool
     changed: bool
     reason: str = ""
+    added_count: int = 0
 
 
 def validate_transition(previous: BoardState | None, current: BoardState) -> TransitionResult:
@@ -151,7 +152,7 @@ def validate_transition(previous: BoardState | None, current: BoardState) -> Tra
     if previous is None:
         if not current.is_count_legal():
             return TransitionResult(False, False, "black/white counts are invalid")
-        return TransitionResult(True, True, "initial state")
+        return TransitionResult(True, True, "initial state", sum(current.counts()))
 
     if previous.size != current.size:
         return TransitionResult(False, False, "board size changed")
@@ -166,19 +167,23 @@ def validate_transition(previous: BoardState | None, current: BoardState) -> Tra
     ]
     if not changes:
         return TransitionResult(True, False, "unchanged")
-    if len(changes) != 1:
-        return TransitionResult(False, False, "more than one intersection changed")
 
-    x, y, before, after = changes[0]
-    if before is not Stone.EMPTY or after is Stone.EMPTY:
-        return TransitionResult(False, False, f"non-placement change at {x},{y}")
+    if any(before is not Stone.EMPTY or after is Stone.EMPTY for _, _, before, after in changes):
+        return TransitionResult(False, False, "a previous stone was removed or recolored")
 
     try:
         expected = previous.side_to_move()
     except ValueError:
         return TransitionResult(False, False, "previous board has invalid stone counts")
-    if after is not expected:
-        return TransitionResult(False, False, "new stone has the wrong color")
+    added_count = len(changes)
+    black_added = sum(after is Stone.BLACK for _, _, _, after in changes)
+    white_added = added_count - black_added
+    expected_black = (added_count + int(expected is Stone.BLACK)) // 2
+    expected_white = added_count - expected_black
+    if black_added != expected_black or white_added != expected_white:
+        return TransitionResult(False, False, "new stones do not follow turn order")
     if not current.is_count_legal():
         return TransitionResult(False, False, "black/white counts are invalid")
-    return TransitionResult(True, True, "legal placement")
+    if added_count == 1:
+        return TransitionResult(True, True, "legal placement", added_count)
+    return TransitionResult(True, True, f"caught up {added_count} placements", added_count)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -9,8 +8,8 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRect, QRectF, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,6 +45,7 @@ from .capture import (
 )
 from .domain import BoardState, Stone
 from .engine import RapfiAnalyzer, RapfiConfig
+from .profiles import ProfileStore
 from .sessions import SessionLogger
 from .vision import BoardProfile, StableStateTracker, grid_points_in_source, order_corners, recognize_frame
 
@@ -211,6 +211,7 @@ class CalibrationCanvas(QWidget):
         super().__init__(parent)
         self.setMinimumSize(720, 540)
         self._pixmap = _bgr_to_pixmap(frame)
+        self._frame = frame
         self._points: list[tuple[float, float]] = []
         self._display_rect = QRectF()
 
@@ -249,6 +250,31 @@ class CalibrationCanvas(QWidget):
             target.height(),
         )
         painter.drawPixmap(self._display_rect.toRect(), self._pixmap)
+        if len(self._points) == 4:
+            source = np.array(order_corners(self._points), dtype=np.float32)
+            edge = 840.0
+            destination = np.array(
+                [(0, 0), (edge, 0), (edge, edge), (0, edge)],
+                dtype=np.float32,
+            )
+            inverse = cv2.getPerspectiveTransform(destination, source)
+            grid = np.array(
+                [
+                    [[x * edge / 14, y * edge / 14]]
+                    for y in range(15)
+                    for x in range(15)
+                ],
+                dtype=np.float32,
+            )
+            projected = cv2.perspectiveTransform(grid, inverse).reshape(-1, 2)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#16a6a0"), 1.2))
+            for x, y in projected:
+                point = QPointF(
+                    self._display_rect.left() + x / self._pixmap.width() * self._display_rect.width(),
+                    self._display_rect.top() + y / self._pixmap.height() * self._display_rect.height(),
+                )
+                painter.drawEllipse(point, 2.2, 2.2)
         for index, (x, y) in enumerate(self._points, start=1):
             point = QPointF(
                 self._display_rect.left() + x / self._pixmap.width() * self._display_rect.width(),
@@ -291,7 +317,24 @@ class CalibrationDialog(QDialog):
 
     def _on_points_changed(self, count: int) -> None:
         self._count.setText(f"{count} / 4")
-        self._save_button.setEnabled(count == 4)
+        if count == 4:
+            profile = self.profile()
+            score = recognize_frame(self._frame, profile).grid_score
+            if score >= 0.35:
+                self._save_button.setEnabled(True)
+                self._hint.setText(
+                    f"Grid alignment {score:.0%}. Cyan points are on intersections; save calibration."
+                )
+            else:
+                self._save_button.setEnabled(False)
+                self._hint.setText(
+                    f"Grid alignment {score:.0%}. Clear points and click the four outer intersections."
+                )
+        else:
+            self._save_button.setEnabled(False)
+            self._hint.setText(
+                "Click top-left, top-right, bottom-right, then bottom-left intersections."
+            )
 
     def profile(self) -> BoardProfile:
         if len(self._canvas.points) != 4:
@@ -359,7 +402,8 @@ class MainWindow(QMainWindow):
         self.resize(1220, 820)
         self._board = BoardState.empty()
         self._candidates: tuple[CandidateMove, ...] = ()
-        self._profile: BoardProfile | None = self._load_profile()
+        self._profile_store = ProfileStore(Path.cwd() / "profiles")
+        self._profile: BoardProfile | None = None
         self._last_frame: np.ndarray | None = None
         self._last_window: WindowInfo | None = None
         self._capture_session = WindowCaptureSession()
@@ -409,10 +453,11 @@ class MainWindow(QMainWindow):
         self._edit_mode.addItem("Place white", Stone.WHITE)
         self._edit_mode.addItem("Erase", Stone.EMPTY)
         self._edit_mode.currentIndexChanged.connect(self._update_edit_mode)
-        self._turn_scope = QComboBox()
-        self._turn_scope.addItem("Analyze both colors", None)
-        self._turn_scope.addItem("Only black turns", Stone.BLACK)
-        self._turn_scope.addItem("Only white turns", Stone.WHITE)
+        self._my_color = QComboBox()
+        self._my_color.addItem("Choose my color", None)
+        self._my_color.addItem("Black", Stone.BLACK)
+        self._my_color.addItem("White", Stone.WHITE)
+        self._my_color.addItem("Analyze both colors", "both")
         self._overlay_toggle = QCheckBox("Show transparent overlay")
         self._overlay_toggle.setChecked(True)
         self._overlay_toggle.toggled.connect(self._refresh_overlay)
@@ -420,6 +465,11 @@ class MainWindow(QMainWindow):
         self._profile_status = QLabel(self._profile_status_text())
         self._engine_status = QLabel(self._engine_status_text())
         self._status = QLabel("Ready")
+        self._status.setWordWrap(True)
+        self._status.setMinimumHeight(42)
+        self._status.setStyleSheet(
+            "background: #edf3f2; border: 1px solid #b7c7c3; padding: 5px;"
+        )
         self._candidate_text = QLabel("No analysis yet")
         self._candidate_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._candidate_text.setWordWrap(True)
@@ -432,9 +482,10 @@ class MainWindow(QMainWindow):
         controls.addRow("", self._load_image_button)
         controls.addRow("", self._calibrate_button)
         controls.addRow("Profile", self._profile_status)
+        controls.addRow("Sync status", self._status)
         controls.addRow("", self._observe_button)
         controls.addRow("Edit board", self._edit_mode)
-        controls.addRow("Analyze turns", self._turn_scope)
+        controls.addRow("My color", self._my_color)
         controls.addRow("Rapfi search", self._search_time)
         controls.addRow("", self._engine_button)
         controls.addRow("Engine", self._engine_status)
@@ -453,7 +504,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(suggestion_group)
         right_layout.addWidget(QLabel("Latest source frame"))
         right_layout.addWidget(self._preview, 1)
-        right_layout.addWidget(self._status)
 
         splitter = QSplitter()
         splitter.addWidget(self._board_canvas)
@@ -465,6 +515,8 @@ class MainWindow(QMainWindow):
         self._capture_timer.setInterval(250)
         self._capture_timer.timeout.connect(self._observe_tick)
         self.analysis_ready.connect(self._on_analysis_ready)
+        self._refresh_shortcut = QShortcut(QKeySequence("F5"), self)
+        self._refresh_shortcut.activated.connect(self.refresh_windows)
         self.refresh_windows()
         self._update_edit_mode()
 
@@ -472,31 +524,24 @@ class MainWindow(QMainWindow):
         candidate = Path.cwd() / "vendor" / "rapfi" / "Rapfi.exe"
         return candidate if candidate.is_file() else None
 
-    def _profile_path(self) -> Path:
-        return Path.cwd() / "profiles" / "default.json"
-
-    def _load_profile(self) -> BoardProfile | None:
-        path = self._profile_path()
-        if not path.is_file():
-            return None
-        try:
-            return BoardProfile.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
-
     def _save_profile(self) -> None:
         if self._profile is None:
             return
-        path = self._profile_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._profile.to_dict(), indent=2), encoding="utf-8")
+        if self._profile.window_title is None:
+            self._status.setText(
+                "Screenshot calibration is active only for this session. Select a window and calibrate to save it."
+            )
+            return
+        self._profile_store.save(self._profile)
 
     def _profile_status_text(self) -> str:
         if self._profile is None:
             return "Not calibrated"
+        if self._profile.schema_version < 2:
+            return "Legacy profile: recalibrate"
         if self._profile.source_width is None:
             return "Legacy profile: recalibrate"
-        return "15x15 calibrated"
+        return f"15x15 calibrated: {self._profile.window_title}"
 
     def _engine_status_text(self) -> str:
         if self._rapfi_path and self._rapfi_path.is_file():
@@ -509,6 +554,7 @@ class MainWindow(QMainWindow):
 
     def refresh_windows(self) -> None:
         current = self._selected_handle()
+        blocker = QSignalBlocker(self._window_combo)
         self._window_combo.clear()
         own_handle = int(self.winId())
         for window in list_visible_windows(exclude_handle=own_handle):
@@ -520,6 +566,10 @@ class MainWindow(QMainWindow):
             index = self._window_combo.findData(current)
             if index >= 0:
                 self._window_combo.setCurrentIndex(index)
+        del blocker
+        selected = self._selected_handle()
+        if selected != current:
+            self._on_target_window_changed(self._window_combo.currentIndex())
         if self._window_combo.count() == 0:
             self._status.setText("No eligible Windows application window found.")
 
@@ -531,6 +581,14 @@ class MainWindow(QMainWindow):
         self._overlay.hide()
         self._preview.setPixmap(QPixmap())
         self._preview.setText("No frame captured")
+        handle = self._selected_handle()
+        window = get_window_info(handle) if handle is not None else None
+        self._profile = self._profile_store.load_for(window) if window else None
+        self._profile_status.setText(self._profile_status_text())
+        if window:
+            self._status.setText(
+                "Selected target. Capture a frame, then calibrate if no profile was loaded."
+            )
 
     def capture_frame(self) -> np.ndarray | None:
         handle = self._selected_handle()
@@ -559,6 +617,9 @@ class MainWindow(QMainWindow):
 
         self._last_frame = frame
         self._last_window = window
+        if self._profile is None:
+            self._profile = self._profile_store.load_for(window)
+            self._profile_status.setText(self._profile_status_text())
         self._preview.setPixmap(
             _bgr_to_pixmap(frame).scaled(
                 self._preview.size(),
@@ -634,6 +695,22 @@ class MainWindow(QMainWindow):
             self._observe_button.setChecked(False)
             QMessageBox.information(self, "Calibration required", "Calibrate the 15x15 board first.")
             return
+        if enabled and self._profile.schema_version < 2:
+            self._observe_button.setChecked(False)
+            QMessageBox.information(
+                self,
+                "Recalibration required",
+                "This saved profile predates grid validation. Capture a frame and calibrate again.",
+            )
+            return
+        if enabled and self._my_color.currentData() is None:
+            self._observe_button.setChecked(False)
+            QMessageBox.information(
+                self,
+                "Choose my color",
+                "Choose Black, White, or Analyze both colors before observation starts.",
+            )
+            return
         if enabled:
             frame = self.capture_frame()
             if frame is None or self._last_window is None:
@@ -670,17 +747,36 @@ class MainWindow(QMainWindow):
             self._status.setText(f"Recognition paused: {error}")
             return
         if committed is not None:
-            self._set_board(committed, analyze=self._should_analyze_turn(committed))
-            self._status.setText(
-                f"Committed visual board: {transition.reason}; confidence {recognition.confidence:.0%}"
-            )
+            should_analyze = self._should_analyze_turn(committed)
+            self._set_board(committed, analyze=should_analyze)
+            black, white = committed.counts()
+            next_side = "Black" if committed.side_to_move() is Stone.BLACK else "White"
+            if should_analyze:
+                self._status.setText(
+                    f"Synced B{black}/W{white}; {transition.reason}; analyzing {next_side}."
+                )
+            else:
+                self._candidate_text.setText(f"Synced. Waiting for your {next_side} turn.")
+                self._status.setText(
+                    f"Synced B{black}/W{white}; {transition.reason}; waiting for {next_side}."
+                )
         elif not transition.valid:
             self._overlay.hide()
-            self._status.setText(f"Recognition paused: {transition.reason}")
+            black, white = recognition.board.counts()
+            self._status.setText(
+                f"Not synced: {transition.reason}; grid {recognition.grid_score:.0%}; "
+                f"detected B{black}/W{white}."
+            )
+        else:
+            black, white = recognition.board.counts()
+            self._status.setText(
+                f"Watching: grid {recognition.grid_score:.0%}; detected B{black}/W{white}; "
+                f"{transition.reason}."
+            )
 
     def _should_analyze_turn(self, board: BoardState) -> bool:
-        scope = self._turn_scope.currentData()
-        return scope is None or board.side_to_move() is scope
+        my_color = self._my_color.currentData()
+        return my_color == "both" or board.side_to_move() is my_color
 
     def _update_edit_mode(self) -> None:
         value = self._edit_mode.currentData()
