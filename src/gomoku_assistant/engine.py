@@ -8,7 +8,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer, ProofStatus, SearchStats
+from .analysis import (
+    AnalysisResult,
+    CandidateMove,
+    HeuristicAnalyzer,
+    ProofStatus,
+    RejectedMove,
+    RecommendationMode,
+    SearchStats,
+    assess_tactical_position,
+    filter_safe_candidates,
+)
 from .domain import BoardState, Stone
 
 
@@ -242,14 +252,27 @@ class RapfiAnalyzer:
         hard_timeout_ms = min(total_timeout_ms, MAX_TOTAL_ANALYSIS_TIME_MS)
         if hard_timeout_ms < requested_time_ms:
             raise ValueError("Total analysis time cannot be shorter than the engine search time.")
-        if not self.available:
-            raise FileNotFoundError(f"Rapfi executable not found: {self.config.executable}")
         if board.size != 15:
             raise ValueError("This MVP configures Rapfi for 15x15 only.")
         if not board.is_count_legal():
             raise ValueError("Board counts are invalid.")
         if board.is_terminal():
             return AnalysisResult(board=board, candidates=(), engine_name=self.name)
+
+        # These positions are exact one-ply facts. Avoid consuming a game-clock
+        # search budget or letting an engine text score obscure the only defense.
+        tactical = assess_tactical_position(board, limit)
+        if tactical.mode is not RecommendationMode.NORMAL:
+            return AnalysisResult(
+                board=board,
+                candidates=tactical.candidates,
+                engine_name="Tactical safety check",
+                recommendation_mode=tactical.mode,
+                danger_points=tactical.danger_points,
+                safe_candidate_count=len(tactical.candidates),
+            )
+        if not self.available:
+            raise FileNotFoundError(f"Rapfi executable not found: {self.config.executable}")
 
         started_at = time.monotonic()
         hard_deadline = started_at + hard_timeout_ms / 1000
@@ -285,10 +308,8 @@ class RapfiAnalyzer:
                 raise EngineProtocolError(
                     "Rapfi returned no candidate before the timeout. Output:\n" + raw_output[-2000:]
                 )
-            engine_name = self.name
-            if len(candidates) < limit:
-                candidates = self._fill_with_tactical_alternatives(board, candidates, limit)
-                engine_name = "Rapfi + tactical alternatives"
+            candidates, rejected_moves = self._safe_candidates(board, candidates, limit)
+            engine_name = "Rapfi + tactical safety"
             self._warmed = True
             depth, engine_time_ms = parse_rapfi_search_summary(raw_output)
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
@@ -297,6 +318,8 @@ class RapfiAnalyzer:
                 candidates=candidates,
                 engine_name=engine_name,
                 raw_output=raw_output,
+                safe_candidate_count=len(candidates),
+                rejected_moves=rejected_moves,
                 search_stats=SearchStats(
                     requested_time_ms=requested_time_ms,
                     elapsed_ms=elapsed_ms,
@@ -420,27 +443,12 @@ class RapfiAnalyzer:
                 return
 
     @staticmethod
-    def _fill_with_tactical_alternatives(
+    def _safe_candidates(
         board: BoardState,
         engine_moves: tuple[CandidateMove, ...],
         limit: int,
-    ) -> tuple[CandidateMove, ...]:
-        merged = list(engine_moves)
-        seen = {(move.x, move.y) for move in merged}
-        for move in HeuristicAnalyzer().analyze(board, limit=limit + len(merged)).candidates:
-            if (move.x, move.y) not in seen:
-                merged.append(move)
-                seen.add((move.x, move.y))
-            if len(merged) >= limit:
-                break
-        return tuple(
-            CandidateMove(
-                x=move.x,
-                y=move.y,
-                rank=index,
-                score=move.score,
-                proof=move.proof,
-                principal_variation=move.principal_variation,
-            )
-            for index, move in enumerate(merged[:limit], start=1)
+    ) -> tuple[tuple[CandidateMove, ...], tuple[RejectedMove, ...]]:
+        ranked_moves = tuple(("rapfi", move) for move in engine_moves) + tuple(
+            ("local", move) for move in HeuristicAnalyzer().ranked_moves(board)
         )
+        return filter_safe_candidates(board, ranked_moves, limit)

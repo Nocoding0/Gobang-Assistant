@@ -1,6 +1,13 @@
 import json
 
-from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus, SearchStats
+from gomoku_assistant.analysis import (
+    AnalysisResult,
+    CandidateMove,
+    ProofStatus,
+    RecommendationMode,
+    RejectedMove,
+    SearchStats,
+)
 from gomoku_assistant.domain import BoardState, CorrectionEvent, Stone
 from gomoku_assistant.sessions import SessionLogger
 
@@ -19,6 +26,12 @@ def test_session_records_the_board_analyzed_by_the_engine(tmp_path) -> None:
             ),
         ),
         engine_name="Rapfi",
+        recommendation_mode=RecommendationMode.FORCED_DEFENSE,
+        danger_points=((8, 7),),
+        safe_candidate_count=1,
+        rejected_moves=(
+            RejectedMove(6, 7, "local", "allows an immediate opponent win", ((8, 7),)),
+        ),
         search_stats=SearchStats(
             requested_time_ms=15_000,
             elapsed_ms=14_822,
@@ -41,8 +54,11 @@ def test_session_records_the_board_analyzed_by_the_engine(tmp_path) -> None:
 
     assert target is not None
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["analyses"][0]["search"]["requested_time_ms"] == 15_000
+    assert payload["analyses"][0]["recommendation_mode"] == "forced-defense"
+    assert payload["analyses"][0]["danger_points"] == [[8, 7]]
+    assert payload["analyses"][0]["rejected_moves"][0]["source"] == "local"
 
 
 def test_session_records_manual_correction_events(tmp_path) -> None:

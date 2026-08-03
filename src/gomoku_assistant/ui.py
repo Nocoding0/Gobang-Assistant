@@ -31,7 +31,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer, ProofStatus
+from .analysis import (
+    AnalysisResult,
+    CandidateMove,
+    HeuristicAnalyzer,
+    ProofStatus,
+    RecommendationMode,
+)
 from .capture import (
     BlankFrameError,
     CaptureError,
@@ -96,6 +102,7 @@ class BoardCanvas(QWidget):
         self._last_move: tuple[int, int] | None = None
         self._correction_points: tuple[tuple[int, int], ...] = ()
         self._ambiguous_points: tuple[tuple[int, int], ...] = ()
+        self._danger_points: tuple[tuple[int, int], ...] = ()
 
     @property
     def board(self) -> BoardState:
@@ -107,6 +114,10 @@ class BoardCanvas(QWidget):
 
     def set_candidates(self, candidates: tuple[CandidateMove, ...]) -> None:
         self._candidates = candidates
+        self.update()
+
+    def set_danger_points(self, points: tuple[tuple[int, int], ...]) -> None:
+        self._danger_points = points
         self.update()
 
     def set_edit_mode(self, mode: Stone | str) -> None:
@@ -234,6 +245,20 @@ class BoardCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor("#167e79"), max(2.0, spacing * 0.06)))
             painter.drawEllipse(center, stone_radius * 0.93, stone_radius * 0.93)
+
+        for x, y in self._danger_points:
+            if not self._board.in_bounds(x, y) or self._board.at(x, y) is not Stone.EMPTY:
+                continue
+            center = self._point_to_screen(x, y)
+            painter.setPen(QPen(QColor("#9d2745"), max(2.0, spacing * 0.065)))
+            painter.drawLine(
+                QPointF(center.x() - stone_radius * 0.55, center.y() - stone_radius * 0.55),
+                QPointF(center.x() + stone_radius * 0.55, center.y() + stone_radius * 0.55),
+            )
+            painter.drawLine(
+                QPointF(center.x() + stone_radius * 0.55, center.y() - stone_radius * 0.55),
+                QPointF(center.x() - stone_radius * 0.55, center.y() + stone_radius * 0.55),
+            )
 
         if self._last_move is not None and self._board.in_bounds(*self._last_move):
             center = self._point_to_screen(*self._last_move)
@@ -1227,6 +1252,7 @@ class MainWindow(QMainWindow):
         self._analysis_version += 1
         self._candidates = ()
         self._board_canvas.set_candidates(())
+        self._board_canvas.set_danger_points(())
 
     def clear_board(self) -> None:
         if self._observe_button.isChecked():
@@ -1335,13 +1361,34 @@ class MainWindow(QMainWindow):
             return
         self._candidates = result.candidates
         self._board_canvas.set_candidates(result.candidates)
+        self._board_canvas.set_danger_points(
+            result.danger_points
+            if result.recommendation_mode is RecommendationMode.FORCED_LOSS
+            else ()
+        )
         self._session.append(result)
         if not result.candidates:
-            self._candidate_text.setText(f"{result.engine_name}: no legal move.")
+            if result.recommendation_mode is RecommendationMode.FORCED_LOSS:
+                points = ", ".join(
+                    self._board.coordinate_name(x, y) for x, y in result.danger_points
+                )
+                self._candidate_text.setText(
+                    "No single move prevents immediate loss."
+                    + (f" Opponent winning points: {points}." if points else "")
+                )
+                self._status.setText("Immediate threats cannot all be blocked.")
+            else:
+                self._candidate_text.setText(f"{result.engine_name}: no safe legal move.")
             return
         lines: list[str] = []
-        if result.candidates[0].proof is ProofStatus.FORCED_LOSS:
-            lines.append("Rapfi currently reports a forced loss. Only an opponent mistake can recover it.")
+        if result.recommendation_mode is RecommendationMode.WIN_NOW:
+            lines.append("Immediate win available.")
+        elif result.recommendation_mode is RecommendationMode.FORCED_DEFENSE:
+            move = result.candidates[0]
+            lines.append(
+                "Only move to avoid immediate loss: "
+                + self._board.coordinate_name(move.x, move.y)
+            )
         lines.extend(
             "\n".join(
                 f"{move.rank}. {self._board.coordinate_name(move.x, move.y)}"

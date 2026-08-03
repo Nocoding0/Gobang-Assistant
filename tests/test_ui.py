@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
-from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus
+from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus, RecommendationMode
 from gomoku_assistant.domain import BoardState, Stone
 from gomoku_assistant.ui import CalibrationDialog, MainWindow
 from gomoku_assistant.vision import CellEvidence, RecognitionResult
@@ -101,6 +101,32 @@ def test_suggestions_stay_inside_assistant_window() -> None:
     assert not hasattr(window, "_overlay")
     assert not hasattr(window, "_overlay_toggle")
     assert window._candidates == (candidate,)
+    window.close()
+
+
+def test_forced_loss_marks_dangers_without_inventing_candidates() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    window._board = board
+    window._board_canvas.set_board(board)
+    window._analysis_version = 1
+
+    window._on_analysis_ready(
+        1,
+        AnalysisResult(
+            board=board,
+            candidates=(),
+            engine_name="Tactical safety check",
+            recommendation_mode=RecommendationMode.FORCED_LOSS,
+            danger_points=((6, 7), (8, 7)),
+        ),
+    )
+
+    assert application is not None
+    assert window._candidates == ()
+    assert window._board_canvas._danger_points == ((6, 7), (8, 7))
+    assert "No single move prevents immediate loss" in window._candidate_text.text()
     window.close()
 
 

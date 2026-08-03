@@ -50,8 +50,8 @@ After the application opens, follow these steps:
    `Start observing`. Rapfi starts and warms up first; then the app waits for
    three matching frames, verifies turn order, and catches up when multiple
    moves appear between samples.
-6. 识别到新局面后，助手中央棋盘上的红色 `1` 是 Rapfi 的首选。其余两个候选由本地战术算法补充。
-   After a new position is recognized, red `1` on the assistant's central board is Rapfi's preferred move. The other two moves are local tactical alternatives.
+6. 识别到新局面后，助手中央棋盘显示通过战术安全检查的建议。通常最多三个；若只有一个点能挡住对方的立即胜利，则只显示该点；无单点可挡时不显示建议，并以酒红色叉号标出对方的胜点。
+   After a new position is recognized, the assistant board shows tactically safe suggestions. It normally shows up to three; when exactly one point prevents an immediate loss, it shows only that point. When no single move can defend, it shows no suggestion and marks the opponent's winning points with burgundy crosses.
 
 如果只想先测试棋力，不需要窗口识别：直接在左侧棋盘点击摆子，然后点击 `Analyze position`。
 
@@ -115,12 +115,12 @@ Data flows through:
    pause observation instead of guessing.
 
 4. **棋力层 / Engine**
-   Rapfi 在本地进程中运行，根据当前局面搜索最佳走法。随附版本稳定输出最佳一手；程序再用本地战术算法补足第二和第三候选，所以不会把它们伪装成 Rapfi 的精确评分。
+   Rapfi 在本地进程中运行，根据当前局面搜索最佳走法。随附版本稳定输出最佳一手；程序会先处理立即胜负和唯一防守，再将 Rapfi 与本地候选进行即时杀和双威胁安全检查。只有真正安全的点才会显示，最多三个，不会为了凑数补充危险落点。
 
-   Rapfi runs as a local process and searches the best move. The bundled version reliably returns one best move; the app uses a local tactical algorithm for second and third alternatives, without presenting them as exact Rapfi scores.
+   Rapfi runs as a local process and searches the best move. The bundled version reliably returns one best move; the app first resolves immediate wins, losses, and mandatory blocks, then checks Rapfi and local alternatives for immediate losses and double threats. Only genuinely safe moves are shown, up to three, with no unsafe padding.
 
 5. **显示与记录层 / Display and Logging**
-   助手棋盘显示当前局面、可靠的棋子手数和候选，并标出最后确认的一手。人工修正会在本局持续覆盖自动识别，直到新局、重新开始观察、切换窗口、重新标定或主动清除。关闭程序时会把逐手记录、纠错事件、分析参数、实际搜索时间、深度和终局结果保存到 `sessions/`，可用于复盘。
+   助手棋盘显示当前局面、可靠的棋子手数和候选，并标出最后确认的一手。人工修正会在本局持续覆盖自动识别，直到新局、重新开始观察、切换窗口、重新标定或主动清除。关闭程序时会把逐手记录、纠错事件、分析参数、实际搜索时间、深度、战术模式、危险点和被拒绝的候选保存到 `sessions/`，可用于复盘。
 
    The assistant board shows the position, reliable move numbers, the latest confirmed move, and suggestions. Manual corrections override visual recognition for the current game until a new game, a new observation run, a target switch, recalibration, or an explicit clear. On close, it saves moves, correction events, analysis parameters, elapsed time, depth, and terminal results to `sessions/` for replay.
 

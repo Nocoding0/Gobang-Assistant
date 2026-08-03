@@ -24,6 +24,10 @@ class SessionEntry:
     move_number: int = 0
     side_to_move: str = "black"
     search: dict[str, object] | None = None
+    recommendation_mode: str = "normal"
+    danger_points: tuple[tuple[int, int], ...] = ()
+    safe_candidate_count: int = 0
+    rejected_moves: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,19 @@ class SessionLogger:
                     }
                     for move in result.candidates
                 ),
+                recommendation_mode=result.recommendation_mode.value,
+                danger_points=result.danger_points,
+                safe_candidate_count=result.safe_candidate_count,
+                rejected_moves=tuple(
+                    {
+                        "x": move.x,
+                        "y": move.y,
+                        "source": move.source,
+                        "reason": move.reason,
+                        "danger_points": move.danger_points,
+                    }
+                    for move in result.rejected_moves
+                ),
             )
         )
 
@@ -182,7 +199,7 @@ class SessionLogger:
         target.write_text(
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "games": self.games,
                     "moves": [asdict(move) for move in self.moves],
                     "corrections": [asdict(correction) for correction in self.corrections],
