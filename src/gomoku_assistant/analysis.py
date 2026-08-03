@@ -31,6 +31,8 @@ class CandidateMove:
     score: int | None
     proof: ProofStatus
     principal_variation: tuple[tuple[int, int], ...] = ()
+    source: str = "local"
+    evaluation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,7 +135,7 @@ def assess_tactical_position(board: BoardState, limit: int = 3) -> TacticalAsses
     own_wins = immediate_winning_points(board, side)
     if own_wins:
         moves = tuple(
-            CandidateMove(x, y, rank, 100_000_000, ProofStatus.WIN_IN_ONE, ((x, y),))
+            CandidateMove(x, y, rank, 100_000_000, ProofStatus.WIN_IN_ONE, ((x, y),), "rule")
             for rank, (x, y) in enumerate(own_wins[:limit], start=1)
         )
         return TacticalAssessment(RecommendationMode.WIN_NOW, moves)
@@ -143,7 +145,7 @@ def assess_tactical_position(board: BoardState, limit: int = 3) -> TacticalAsses
         x, y = danger_points[0]
         return TacticalAssessment(
             RecommendationMode.FORCED_DEFENSE,
-            (CandidateMove(x, y, 1, None, ProofStatus.BLOCK_REQUIRED, ((x, y),)),),
+            (CandidateMove(x, y, 1, None, ProofStatus.BLOCK_REQUIRED, ((x, y),), "rule"),),
             danger_points,
         )
     if len(danger_points) >= 2:
@@ -206,7 +208,8 @@ def filter_safe_candidates(
     return (
         tuple(
             CandidateMove(
-                move.x, move.y, rank, move.score, move.proof, move.principal_variation
+                move.x, move.y, rank, move.score, move.proof, move.principal_variation,
+                move.source, move.evaluation,
             )
             for rank, move in enumerate(accepted, start=1)
         ),
@@ -270,6 +273,7 @@ class HeuristicAnalyzer:
                     score=score,
                     proof=proof,
                     principal_variation=((x, y),),
+                    source="local",
                 )
             )
 
@@ -282,6 +286,8 @@ class HeuristicAnalyzer:
                 score=candidate.score,
                 proof=candidate.proof,
                 principal_variation=candidate.principal_variation,
+                source=candidate.source,
+                evaluation=candidate.evaluation,
             )
             for index, candidate in enumerate(candidates, start=1)
         )

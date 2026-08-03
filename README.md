@@ -67,6 +67,10 @@ When the target cannot be recognized reliably, open the `手动搬运` tab, choo
 
 Before entering the next opponent move, `改走本手` removes the auto-selected point so you can choose another recommendation or any actual move. `撤销上一手` rolls back the latest entry. `编辑局面` rebuilds a mid-game position; only moves entered reliably after setup receive move numbers.
 
+两个模式都提供棋色选择，选择黑棋或白棋会自动同步。分析期间会显示 `Rapfi 引擎正在思考`、实时已用时间和本手预算；第 1 推荐显示 Rapfi 的原始内部评估，第 2/3 推荐显示本地战术分。它们不是胜率，也不能直接互相比较。
+
+Both modes provide a color selector and keep black/white choices synchronized. During analysis the UI shows `Rapfi 引擎正在思考`, live elapsed time, and the move budget. Recommendation 1 shows Rapfi's raw internal evaluation; recommendations 2 and 3 show local tactical scores. Neither is a win probability, and the two scales are not directly comparable.
+
 ## 界面说明 / Interface Guide
 
 - `Refresh windows`: 重新扫描可以读取的 Windows 窗口。  

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import sys
+import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -530,6 +532,11 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("Nocoding0", "GomokuTrainingAssistant")
         self._rapfi_path = self._default_rapfi_path()
         self._rapfi_analyzer: RapfiAnalyzer | None = None
+        self._analysis_started_at: float | None = None
+        self._analysis_progress_version: int | None = None
+        self._analysis_progress_budget_ms = 0
+        self._analysis_is_rapfi = False
+        self._color_syncing = False
 
         self._board_canvas = BoardCanvas()
         self._board_canvas.board_edited.connect(self._on_manual_board_edit)
@@ -603,6 +610,16 @@ class MainWindow(QMainWindow):
         self._my_color.addItem("White", Stone.WHITE)
         self._my_color.addItem("Analyze both colors", "both")
         self._my_color.currentIndexChanged.connect(self._on_my_color_changed)
+        self._my_color.currentIndexChanged.connect(self._sync_manual_color_from_vision)
+        self._manual_color = QComboBox()
+        self._manual_color.addItem("请选择棋色", None)
+        self._manual_color.addItem("执黑", Stone.BLACK)
+        self._manual_color.addItem("执白", Stone.WHITE)
+        self._manual_color.currentIndexChanged.connect(self._sync_vision_color_from_manual)
+        saved_color = str(self._settings.value("my_color", ""))
+        saved_stone = Stone.BLACK if saved_color == "BLACK" else Stone.WHITE if saved_color == "WHITE" else None
+        if saved_stone is not None:
+            self._my_color.setCurrentIndex(self._my_color.findData(saved_stone))
         self._manual_start_button = QPushButton("新建手动对局")
         self._manual_start_button.clicked.connect(self.start_manual_game)
         self._manual_continue_button = QPushButton("从当前局面继续")
@@ -628,6 +645,14 @@ class MainWindow(QMainWindow):
         self._candidate_text = QLabel("No analysis yet")
         self._candidate_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._candidate_text.setWordWrap(True)
+        self._turn_instruction = QLabel("选择模式并开始对局。")
+        self._turn_instruction.setWordWrap(True)
+        self._turn_instruction.setStyleSheet("font-weight: 600; color: #1a4f69;")
+        self._analysis_progress_text = QLabel("等待分析")
+        self._analysis_progress = QProgressBar()
+        self._analysis_progress.setRange(0, 1)
+        self._analysis_progress.setValue(0)
+        self._analysis_progress.setTextVisible(True)
 
         control_group = QGroupBox("自动识别")
         controls = QFormLayout(control_group)
@@ -648,6 +673,9 @@ class MainWindow(QMainWindow):
         manual_group = QGroupBox("手动搬运")
         manual_layout = QVBoxLayout(manual_group)
         manual_layout.addWidget(QLabel("把真实棋盘的对方落子点到左侧棋盘。助手会自动采用第 1 推荐。"))
+        manual_color_row = QFormLayout()
+        manual_color_row.addRow("我的棋色", self._manual_color)
+        manual_layout.addLayout(manual_color_row)
         manual_layout.addWidget(self._manual_start_button)
         manual_layout.addWidget(self._manual_continue_button)
         manual_layout.addWidget(self._manual_undo_button)
@@ -673,6 +701,9 @@ class MainWindow(QMainWindow):
 
         suggestion_group = QGroupBox("推荐落点")
         suggestion_layout = QVBoxLayout(suggestion_group)
+        suggestion_layout.addWidget(self._turn_instruction)
+        suggestion_layout.addWidget(self._analysis_progress_text)
+        suggestion_layout.addWidget(self._analysis_progress)
         suggestion_layout.addWidget(self._candidate_text)
         suggestion_layout.addStretch(1)
 
@@ -706,6 +737,9 @@ class MainWindow(QMainWindow):
         self._capture_timer = QTimer(self)
         self._capture_timer.setInterval(250)
         self._capture_timer.timeout.connect(self._observe_tick)
+        self._analysis_timer = QTimer(self)
+        self._analysis_timer.setInterval(100)
+        self._analysis_timer.timeout.connect(self._update_analysis_progress)
         self.analysis_ready.connect(self._on_analysis_ready)
         self.analysis_finished.connect(self._on_analysis_finished)
         self.engine_warmed.connect(self._on_engine_warmed)
@@ -715,6 +749,29 @@ class MainWindow(QMainWindow):
         self._update_edit_mode()
         self._refresh_manual_controls()
         self._refresh_visual_annotations()
+
+    def _sync_manual_color_from_vision(self, _: int) -> None:
+        if self._color_syncing:
+            return
+        value = self._my_color.currentData()
+        target = self._manual_color.findData(value) if isinstance(value, Stone) else 0
+        self._color_syncing = True
+        with QSignalBlocker(self._manual_color):
+            self._manual_color.setCurrentIndex(target if target >= 0 else 0)
+        self._color_syncing = False
+        self._settings.setValue("my_color", value.name if isinstance(value, Stone) else str(value or ""))
+
+    def _sync_vision_color_from_manual(self, _: int) -> None:
+        if self._color_syncing:
+            return
+        value = self._manual_color.currentData()
+        target = self._my_color.findData(value)
+        self._color_syncing = True
+        with QSignalBlocker(self._my_color):
+            self._my_color.setCurrentIndex(target if target >= 0 else 0)
+        self._color_syncing = False
+        self._settings.setValue("my_color", value.name if isinstance(value, Stone) else "")
+        self._on_my_color_changed(self._my_color.currentIndex())
 
     def _default_rapfi_path(self) -> Path | None:
         candidate = Path.cwd() / "vendor" / "rapfi" / "Rapfi.exe"
@@ -732,6 +789,43 @@ class MainWindow(QMainWindow):
         self._settings.setValue("rapfi_white_seconds", self._white_search_time.value())
         self._settings.setValue("rapfi_threads", self._rapfi_threads.value())
         self._settings.setValue("rapfi_hash_mb", int(self._rapfi_hash.currentData()))
+
+    def _begin_analysis_progress(self, version: int, budget_ms: int, rapfi: bool) -> None:
+        self._analysis_started_at = time.monotonic()
+        self._analysis_progress_version = version
+        self._analysis_progress_budget_ms = budget_ms
+        self._analysis_is_rapfi = rapfi
+        self._analysis_progress.setRange(0, max(budget_ms, 1))
+        self._analysis_progress.setValue(0)
+        self._analysis_progress.setFormat("%v / %m ms")
+        self._analysis_progress_text.setText(
+            "Rapfi 引擎正在思考..." if rapfi else "本地战术分析正在计算..."
+        )
+        self._analysis_timer.start()
+
+    def _update_analysis_progress(self) -> None:
+        if self._analysis_started_at is None:
+            return
+        elapsed_ms = int((time.monotonic() - self._analysis_started_at) * 1000)
+        budget_ms = max(self._analysis_progress_budget_ms, 1)
+        self._analysis_progress.setValue(min(elapsed_ms, budget_ms))
+        label = "Rapfi 引擎正在思考" if self._analysis_is_rapfi else "本地战术分析"
+        self._analysis_progress_text.setText(
+            f"{label}：{elapsed_ms / 1000:.1f} / {budget_ms / 1000:.1f} 秒"
+        )
+
+    def _finish_analysis_progress(self, version: int, message: str | None = None) -> None:
+        if version != self._analysis_progress_version:
+            return
+        self._analysis_timer.stop()
+        elapsed_ms = int((time.monotonic() - self._analysis_started_at) * 1000) if self._analysis_started_at else 0
+        self._analysis_started_at = None
+        self._analysis_progress_version = None
+        self._analysis_is_rapfi = False
+        if message is not None:
+            self._analysis_progress_text.setText(message)
+        else:
+            self._analysis_progress_text.setText(f"分析完成：总耗时 {elapsed_ms / 1000:.2f} 秒")
 
     def _current_rapfi_config(self) -> RapfiConfig | None:
         if self._rapfi_path is None or not self._rapfi_path.is_file():
@@ -1579,6 +1673,8 @@ class MainWindow(QMainWindow):
             analyzer = HeuristicAnalyzer()
             self._status.setText("Analyzing with local tactical heuristic...")
 
+        self._begin_analysis_progress(version, search_budget_ms, isinstance(analyzer, RapfiAnalyzer))
+
         self._pending_analyses += 1
         self._set_engine_controls_enabled(False)
         if isinstance(analyzer, RapfiAnalyzer):
@@ -1611,6 +1707,7 @@ class MainWindow(QMainWindow):
         if version != self._analysis_version:
             return
         if isinstance(payload, Exception):
+            self._finish_analysis_progress(version, "分析失败")
             self._candidate_text.setText(f"Engine error: {payload}")
             self._status.setText("Analysis failed. Falling back to the local heuristic is available.")
             return
@@ -1619,6 +1716,7 @@ class MainWindow(QMainWindow):
             return
         if result.board != self._board:
             return
+        self._finish_analysis_progress(version)
         self._candidates = result.candidates
         self._board_canvas.set_candidates(result.candidates)
         self._board_canvas.set_danger_points(
@@ -1640,6 +1738,7 @@ class MainWindow(QMainWindow):
             else:
                 self._candidate_text.setText(f"{result.engine_name}: no safe legal move.")
             return
+        self._candidate_text.setText(self._format_candidate_details(result))
         color = self._my_color.currentData()
         if (
             self._input_mode is InputMode.MANUAL_RELAY
@@ -1656,57 +1755,58 @@ class MainWindow(QMainWindow):
                 self._board_canvas.set_pending_point((chosen.x, chosen.y))
                 self._candidates = result.candidates
                 self._board_canvas.set_candidates(result.candidates)
-                self._candidate_text.setText(
+                self._turn_instruction.setText(
                     f"已自动采用第 1 推荐：{before.coordinate_name(chosen.x, chosen.y)}。"
                     "请在真实棋盘落此点；对方回应后再录入左侧棋盘。"
                 )
                 self._status.setText("等待对方回应，可在回应前点击“改走本手”。")
                 self._refresh_manual_controls()
             return
+        self._turn_instruction.setText("分析完成，请根据推荐落子。")
+        self._status.setText(f"Analysis ready from {result.engine_name}.")
+
+    def _format_candidate_details(self, result: AnalysisResult) -> str:
         lines: list[str] = []
         if result.recommendation_mode is RecommendationMode.WIN_NOW:
-            lines.append("Immediate win available.")
+            lines.append("规则判定：当前可立即获胜")
         elif result.recommendation_mode is RecommendationMode.FORCED_DEFENSE:
-            move = result.candidates[0]
-            lines.append(
-                "Only move to avoid immediate loss: "
-                + self._board.coordinate_name(move.x, move.y)
-            )
-        lines.extend(
-            "\n".join(
-                f"{move.rank}. {self._board.coordinate_name(move.x, move.y)}"
-                f"  {self._candidate_label(move, result)}"
-                f"  {move.proof.value}"
-                for move in result.candidates
-            ).splitlines()
-        )
-        lines.append(f"Engine: {result.engine_name}")
+            lines.append("规则判定：必须防守对方立即胜")
+        for move in result.candidates:
+            coordinate = self._board.coordinate_name(move.x, move.y)
+            if move.source == "rule":
+                metric = "规则判定"
+            elif move.source == "rapfi":
+                metric = f"Rapfi 评估 {move.evaluation or '未提供数值'}"
+            else:
+                metric = f"本地战术分 {move.score:+d}" if move.score is not None else "本地战术候选"
+            pv = ""
+            if move.source == "rapfi" and len(move.principal_variation) > 1:
+                pv = " | PV " + " ".join(
+                    self._board.coordinate_name(x, y) for x, y in move.principal_variation[:4]
+                )
+            lines.append(f"{move.rank}. {coordinate}  {metric}  {move.proof.value}{pv}")
         if result.search_stats is not None:
             stats = result.search_stats
-            details = [
-                f"Search: {stats.elapsed_ms}ms / {stats.requested_time_ms}ms budget",
-            ]
+            details = [f"总耗时 {stats.elapsed_ms}ms", f"预算 {stats.requested_time_ms}ms"]
             if stats.engine_time_ms is not None:
-                details.append(f"engine {stats.engine_time_ms}ms")
+                details.append(f"引擎 {stats.engine_time_ms}ms")
             if stats.depth is not None:
-                details.append(f"depth {stats.depth}")
+                details.append(f"深度 {stats.depth}")
             if stats.threads is not None:
-                details.append(f"{stats.threads} threads")
-            if stats.hash_kib is not None:
-                details.append(f"{stats.hash_kib // 1024}MB hash")
-            lines.append("; ".join(details))
-        self._candidate_text.setText("\n".join(lines))
-        self._status.setText(f"Analysis ready from {result.engine_name}.")
+                details.append(f"{stats.threads} 线程")
+            lines.append(" · ".join(details))
+        return "\n".join(lines)
 
     @staticmethod
     def _candidate_label(move: CandidateMove, result: AnalysisResult) -> str:
-        if move.rank == 1 and result.engine_name.startswith("Rapfi"):
-            return "Rapfi best"
-        if move.rank > 1 and result.engine_name == "Rapfi + tactical alternatives":
-            return "local alternative"
-        return "engine choice" if move.score is None else f"score {move.score:+d}"
+        if move.source == "rapfi":
+            return "Rapfi 主选"
+        if move.source == "rule":
+            return "规则判定"
+        return "本地战术候选"
 
     def closeEvent(self, event: Any) -> None:
+        self._analysis_timer.stop()
         self._capture_timer.stop()
         self._capture_session.stop()
         target = self._session.save()

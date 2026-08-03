@@ -139,6 +139,7 @@ def test_switching_to_white_while_observing_resynchronizes_board() -> None:
     window._observe_button.setChecked(True)
     window._observe_button.blockSignals(False)
 
+    window._my_color.setCurrentIndex(1)
     window._my_color.setCurrentIndex(2)
 
     assert application is not None
@@ -313,4 +314,39 @@ def test_manual_setup_edits_authoritative_board_without_vision_overrides() -> No
     assert application is not None
     assert window._board == edited
     assert window._corrections.count == 0
+    window.close()
+
+
+def test_color_controls_sync_between_vision_and_manual_modes() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    window._my_color.setCurrentIndex(window._my_color.findData(Stone.WHITE))
+    assert application is not None
+    assert window._manual_color.currentData() is Stone.WHITE
+
+    window._manual_color.setCurrentIndex(window._manual_color.findData(Stone.BLACK))
+    assert window._my_color.currentData() is Stone.BLACK
+    window.close()
+
+
+def test_candidate_details_distinguish_rapfi_and_local_scores() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    board = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    result = AnalysisResult(
+        board=board,
+        candidates=(
+            CandidateMove(7, 6, 1, 512, ProofStatus.HEURISTIC, source="rapfi", evaluation="+512"),
+            CandidateMove(6, 7, 2, 2500, ProofStatus.HEURISTIC),
+        ),
+        engine_name="Rapfi + tactical safety",
+    )
+    window._board = board
+
+    details = window._format_candidate_details(result)
+
+    assert application is not None
+    assert "Rapfi 评估 +512" in details
+    assert "本地战术分 +2500" in details
     window.close()

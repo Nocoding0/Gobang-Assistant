@@ -30,6 +30,8 @@ def test_parse_rapfi_detail_lines_and_final_move() -> None:
     assert [(move.x, move.y) for move in moves] == [(8, 7), (6, 7), (7, 6)]
     assert [move.rank for move in moves] == [1, 2, 3]
     assert moves[0].score == 321
+    assert moves[0].source == "rapfi"
+    assert moves[0].evaluation == "321"
 
 
 def test_parse_rapfi_uses_final_move_when_detail_is_missing() -> None:
@@ -85,6 +87,7 @@ def test_parse_rapfi_marks_forced_mate_from_algebraic_detail() -> None:
     assert (moves[0].x, moves[0].y) == (7, 5)
     assert moves[0].score is None
     assert moves[0].proof is ProofStatus.FORCED_WIN
+    assert moves[0].evaluation == "+M13"
 
 
 def test_parse_rapfi_uses_final_summary_for_final_move_proof() -> None:

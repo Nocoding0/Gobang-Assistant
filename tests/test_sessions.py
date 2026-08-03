@@ -54,7 +54,7 @@ def test_session_records_the_board_analyzed_by_the_engine(tmp_path) -> None:
 
     assert target is not None
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 5
+    assert payload["schema_version"] == 6
     assert payload["analyses"][0]["search"]["requested_time_ms"] == 15_000
     assert payload["analyses"][0]["recommendation_mode"] == "forced-defense"
     assert payload["analyses"][0]["danger_points"] == [[8, 7]]

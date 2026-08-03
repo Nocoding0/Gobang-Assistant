@@ -69,6 +69,7 @@ def parse_rapfi_output(
     realtime_point: tuple[int, int] | None = None
     realtime_variation: tuple[tuple[int, int], ...] = ()
     final_score: int | None = None
+    final_evaluation: str | None = None
     final_proof = ProofStatus.HEURISTIC
     has_final_evaluation = False
 
@@ -83,6 +84,7 @@ def parse_rapfi_output(
         final_eval = FINAL_EVAL_RE.match(line)
         if final_eval:
             final_score, final_proof = _parse_rapfi_score(final_eval.group(1))
+            final_evaluation = final_eval.group(1)
             has_final_evaluation = True
             summary_variation = _parse_output_coordinates(line)
             if summary_variation:
@@ -104,6 +106,8 @@ def parse_rapfi_output(
             score=score,
             proof=proof,
             principal_variation=coordinates,
+            source="rapfi",
+            evaluation=match.group(2),
         )
 
     if fallback_point is None:
@@ -138,6 +142,12 @@ def parse_rapfi_output(
                     if current is not None and (current.x, current.y) == fallback_point
                     else fallback_variation or ((x, y),)
                 ),
+                source="rapfi",
+                evaluation=(
+                    final_evaluation
+                    if has_final_evaluation
+                    else current.evaluation if current is not None else None
+                ),
             )
 
     return tuple(
@@ -147,7 +157,9 @@ def parse_rapfi_output(
             rank=index,
             score=move.score,
             proof=move.proof,
-            principal_variation=move.principal_variation,
+                principal_variation=move.principal_variation,
+                source=move.source,
+                evaluation=move.evaluation,
         )
         for index, move in enumerate(
             (ranked[rank] for rank in sorted(ranked)[:limit]), start=1

@@ -166,6 +166,8 @@ class SessionLogger:
                         "score": move.score,
                         "proof": move.proof.value,
                         "pv": list(move.principal_variation),
+                        "source": move.source,
+                        "evaluation": move.evaluation,
                     }
                     for move in result.candidates
                 ),
@@ -210,7 +212,7 @@ class SessionLogger:
         target.write_text(
             json.dumps(
                 {
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "games": self.games,
                     "moves": [asdict(move) for move in self.moves],
                     "corrections": [asdict(correction) for correction in self.corrections],
