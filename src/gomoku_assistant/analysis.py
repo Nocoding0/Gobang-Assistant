@@ -25,11 +25,24 @@ class CandidateMove:
 
 
 @dataclass(frozen=True)
+class SearchStats:
+    """Metadata reported by an engine search, not an engine evaluation."""
+
+    requested_time_ms: int
+    elapsed_ms: int
+    engine_time_ms: int | None = None
+    depth: str | None = None
+    threads: int | None = None
+    hash_kib: int | None = None
+
+
+@dataclass(frozen=True)
 class AnalysisResult:
     board: BoardState
     candidates: tuple[CandidateMove, ...]
     engine_name: str
     raw_output: str = ""
+    search_stats: SearchStats | None = None
 
 
 class HeuristicAnalyzer:

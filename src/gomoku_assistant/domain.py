@@ -146,6 +146,71 @@ class TransitionResult:
     added_count: int = 0
 
 
+@dataclass(frozen=True)
+class ObservedMove:
+    """A move reconstructed from stable visual board states."""
+
+    x: int
+    y: int
+    stone: Stone
+    number: int | None
+    certain: bool
+
+
+def infer_observed_moves(
+    previous: BoardState | None, current: BoardState
+) -> tuple[ObservedMove, ...]:
+    """Recover only move numbers that are provable from two board states.
+
+    A static mid-game board cannot reveal its historical order. Likewise, a
+    catch-up containing two stones of the same color leaves their order unknown.
+    Those stones are retained in the log but deliberately have no move number.
+    """
+
+    if previous is None:
+        changes = [
+            (x, y, current.at(x, y))
+            for y in range(current.size)
+            for x in range(current.size)
+            if current.at(x, y) is not Stone.EMPTY
+        ]
+        if len(changes) == 1 and changes[0][2] is Stone.BLACK:
+            x, y, stone = changes[0]
+            return (ObservedMove(x, y, stone, 1, True),)
+        return tuple(
+            ObservedMove(x, y, stone, None, False) for x, y, stone in changes
+        )
+
+    transition = validate_transition(previous, current)
+    if not transition.valid or not transition.changed:
+        return ()
+
+    changes = [
+        (x, y, current.at(x, y))
+        for y in range(current.size)
+        for x in range(current.size)
+        if previous.at(x, y) is Stone.EMPTY and current.at(x, y) is not Stone.EMPTY
+    ]
+    expected = previous.side_to_move()
+    start_number = sum(previous.counts())
+    records: list[ObservedMove] = []
+    for stone in (expected, expected.opponent):
+        offsets = tuple(
+            offset
+            for offset in range(1, len(changes) + 1)
+            if (expected if offset % 2 else expected.opponent) is stone
+        )
+        matching = [(x, y) for x, y, current_stone in changes if current_stone is stone]
+        if len(offsets) == 1 and len(matching) == 1:
+            x, y = matching[0]
+            records.append(ObservedMove(x, y, stone, start_number + offsets[0], True))
+        else:
+            records.extend(
+                ObservedMove(x, y, stone, None, False) for x, y in matching
+            )
+    return tuple(records)
+
+
 def validate_transition(previous: BoardState | None, current: BoardState) -> TransitionResult:
     """Validate a visual state transition without attempting to repair it."""
 

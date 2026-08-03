@@ -6,9 +6,9 @@ This is a local Windows Gomoku training tool. It reads a selected game window or
 
 ## 当前状态 / Current Status
 
-当前项目是**可运行的 MVP**，已经具备：手工摆局、截图四角校准、Windows 窗口观察、局面合法性检查、Rapfi 引擎分析和本地复盘记录。
+当前项目是**可运行的 MVP**，已经具备：手工摆局、截图四角校准、Windows 窗口观察、局面合法性检查、Rapfi 限时分析、棋子手数编号和本地复盘记录。
 
-The project is a **runnable MVP**. It includes manual board editing, four-corner screenshot calibration, Windows window observation, legal-state checks, Rapfi analysis, and local replay logs.
+The project is a **runnable MVP**. It includes manual board editing, four-corner screenshot calibration, Windows window observation, legal-state checks, time-bounded Rapfi analysis, move numbering, and local replay logs.
 
 它还不是“打开任意五子棋页面就完全自动识别”的最终产品。第一版只针对一个经过校准的微信、浏览器或桌面客户端棋盘皮肤；换窗口大小、缩放比例或主题后，通常需要重新校准。
 
@@ -45,10 +45,11 @@ After the application opens, follow these steps:
    Click `Capture frame` and confirm the lower-right preview is correct.
 4. 点击 `Calibrate`，依次点击棋盘的左上、右上、右下、左下四个**交叉点**。
    Click `Calibrate`, then select the top-left, top-right, bottom-right, and bottom-left board **intersections**, in that order.
-5. 在 `My color` 中选择 Black、White 或 Analyze both colors，再点击 `Start observing`。程序会等待三帧一致的画面，并检查新增棋子是否符合黑白轮次；人机快速回应导致一次新增多颗时会自动追赶。
+5. 在 `My color` 中选择 Black、White 或 Analyze both colors，再点击 `Start observing`。Rapfi 会先启动并预热，之后程序会等待三帧一致的画面，并检查新增棋子是否符合黑白轮次；人机快速回应导致一次新增多颗时会自动追赶。
    Choose Black, White, or Analyze both colors under `My color`, then click
-   `Start observing`. The app waits for three matching frames, verifies turn
-   order, and catches up when multiple moves appear between samples.
+   `Start observing`. Rapfi starts and warms up first; then the app waits for
+   three matching frames, verifies turn order, and catches up when multiple
+   moves appear between samples.
 6. 识别到新局面后，助手中央棋盘上的红色 `1` 是 Rapfi 的首选。其余两个候选由本地战术算法补充。
    After a new position is recognized, red `1` on the assistant's central board is Rapfi's preferred move. The other two moves are local tactical alternatives.
 
@@ -74,8 +75,10 @@ To test the engine without screen recognition, place stones on the left board an
 - `My color`: 每局开始前选择自己执黑、执白或双方分析。棋盘始终同步双方落子，但只有轮到你的棋色时才显示推荐。
   Choose black, white, or both before each game. The board always syncs both
   sides, but suggestions appear only when it is your selected color's turn.
-- `Rapfi search`: 每个局面的搜索时长，默认 `3000 ms`。
-  Search duration per position; the default is `3000 ms`.
+- `Black search` / `White search`: 黑白棋独立的 Rapfi 搜索时长。默认黑棋 `8 s`、白棋 `15 s`；界面和引擎都会拒绝超过 `15 s` 的配置。
+  Independent Rapfi search durations. Defaults are `8 s` for black and `15 s` for white; both the UI and engine reject values above `15 s`.
+- `Rapfi threads` / `Rapfi hash`: 默认使用 `8` 个线程和 `512 MB` 搜索哈希。更改线程或哈希会在下一次分析前重建 Rapfi；黑白时间切换不会重启引擎。
+  Defaults are `8` threads and a `512 MB` search hash. Changing either takes effect by rebuilding Rapfi before the next analysis; switching black/white time does not restart it.
 - `Select Rapfi.exe`: 仅在更换引擎文件时使用。  
   Use this only when changing the engine executable.
 
@@ -113,9 +116,27 @@ Data flows through:
    Rapfi runs as a local process and searches the best move. The bundled version reliably returns one best move; the app uses a local tactical algorithm for second and third alternatives, without presenting them as exact Rapfi scores.
 
 5. **显示与记录层 / Display and Logging**
-   助手棋盘显示当前局面和候选。关闭程序时会把分析记录保存到 `sessions/`，可用于复盘。
+   助手棋盘显示当前局面、可靠的棋子手数和候选，并标出最后确认的一手。关闭程序时会把逐手记录、分析参数、实际搜索时间、深度和终局结果保存到 `sessions/`，可用于复盘。
 
-   The assistant board shows the current position and suggestions. Analysis records are saved to `sessions/` when the app closes.
+   The assistant board shows the position, reliable move numbers, the latest confirmed move, and suggestions. On close, it saves moves, analysis parameters, elapsed time, depth, and terminal results to `sessions/` for replay.
+
+## 搜索时限 / Search Limits
+
+对局计时是硬约束，因此助手不允许把引擎时间拉长到无限。引擎每步最多搜索 `15 s`，从助手确认棋盘到返回或丢弃结果的总期限为 `17 s`，给窗口识别、显示和实际点击保留余量。首次 `Start observing` 会在开始同步棋局前预热 Rapfi，不占用某一步的思考时间。
+
+The game clock is a hard constraint, so the assistant never uses an unbounded search. Rapfi receives at most `15 s` per move, and the assistant returns or discards the result within a `17 s` total deadline after it confirms a board. This leaves time for recognition, display, and the actual click. The first `Start observing` warms Rapfi before board synchronization begins, outside a move's search budget.
+
+Rapfi 的深度由引擎在给定时间内自动迭代加深。助手会记录实际达到的深度，但不修改 Rapfi 的评估模型、权重或源代码；日志用于复盘和比较参数，而不会自动“训练”或覆盖引擎推荐。
+
+Rapfi chooses its own iterative-deepening depth inside the supplied time. The assistant records the reached depth but does not change Rapfi's evaluator, weights, or source code. Logs support replay and parameter comparison only; they do not train or override the engine.
+
+要将已有日志和新参数进行离线对比，可运行以下命令。它默认抽取 20 个不同局面，黑棋按 8 秒、白棋按 15 秒复算，并在 `benchmarks/` 输出报告；每个局面同样不会超过 15 秒引擎时间。
+
+To compare existing logs against the new settings offline, run the command below. It samples 20 unique positions by default, recalculates black at 8 seconds and white at 15 seconds, and writes a report under `benchmarks/`; each position remains capped at 15 engine seconds.
+
+```powershell
+.\.venv\Scripts\python -m gomoku_assistant.benchmark --rapfi vendor\rapfi\Rapfi.exe
+```
 
 ## Rapfi 引擎 / Rapfi Engine
 

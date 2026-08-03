@@ -119,3 +119,35 @@ def test_resync_keeps_last_confirmed_board_while_observing() -> None:
     assert window._tracker.committed is None
     assert "Resynchronizing" in window._status.text()
     window.close()
+
+
+def test_search_controls_cannot_exceed_fifteen_engine_seconds() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    original_black = window._black_search_time.value()
+    original_white = window._white_search_time.value()
+
+    window._black_search_time.setValue(99)
+    window._white_search_time.setValue(99)
+
+    assert application is not None
+    assert window._black_search_time.value() == 15
+    assert window._white_search_time.value() == 15
+    window._black_search_time.setValue(original_black)
+    window._white_search_time.setValue(original_white)
+    window.close()
+
+
+def test_observed_move_numbers_appear_on_the_assistant_board() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    previous = BoardState.empty()
+    current = previous.place(7, 7, Stone.BLACK)
+
+    window._record_observed_moves(previous, current, source="test")
+    window._set_board(current, analyze=False)
+
+    assert application is not None
+    assert window._move_numbers == {(7, 7): 1}
+    assert window._board_canvas._move_numbers == {(7, 7): 1}
+    window.close()

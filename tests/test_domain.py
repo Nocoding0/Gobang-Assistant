@@ -1,4 +1,9 @@
-from gomoku_assistant.domain import BoardState, Stone, validate_transition
+from gomoku_assistant.domain import (
+    BoardState,
+    Stone,
+    infer_observed_moves,
+    validate_transition,
+)
 
 
 def test_empty_board_starts_with_black() -> None:
@@ -76,3 +81,43 @@ def test_visual_transition_catches_up_three_legal_changes() -> None:
 
     assert result.valid
     assert result.added_count == 3
+
+
+def test_observed_moves_number_a_single_placement() -> None:
+    previous = BoardState.empty().place(7, 7, Stone.BLACK)
+    current = previous.place(8, 7, Stone.WHITE)
+
+    moves = infer_observed_moves(previous, current)
+
+    assert [(move.x, move.y, move.number, move.certain) for move in moves] == [
+        (8, 7, 2, True)
+    ]
+
+
+def test_observed_moves_number_two_move_catch_up_when_colors_are_unique() -> None:
+    previous = BoardState.empty()
+    current = previous.set_cell(7, 7, Stone.BLACK).set_cell(8, 7, Stone.WHITE)
+
+    moves = infer_observed_moves(previous, current)
+
+    assert {(move.x, move.y, move.number, move.certain) for move in moves} == {
+        (7, 7, 1, True),
+        (8, 7, 2, True),
+    }
+
+
+def test_observed_moves_do_not_invent_order_for_same_color_catch_up() -> None:
+    previous = BoardState.empty()
+    current = (
+        previous.set_cell(7, 7, Stone.BLACK)
+        .set_cell(8, 7, Stone.WHITE)
+        .set_cell(9, 7, Stone.BLACK)
+    )
+
+    moves = infer_observed_moves(previous, current)
+
+    assert {(move.x, move.number, move.certain) for move in moves} == {
+        (7, None, False),
+        (8, 2, True),
+        (9, None, False),
+    }

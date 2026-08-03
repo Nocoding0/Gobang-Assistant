@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer, ProofStatus
+from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer, ProofStatus, SearchStats
 from .domain import BoardState, Stone
 
 
@@ -16,6 +16,13 @@ COORDINATE_RE = re.compile(r"(?<!\d)(\d{1,2}),(\d{1,2})(?!\d)")
 ALGEBRAIC_COORDINATE_RE = re.compile(r"(?<![A-Z])([A-O])(1[0-5]|[1-9])(?!\d)")
 MULTIPV_RE = re.compile(r"^MESSAGE\s+\((\d+)\)\s+([+-]?(?:M\d+|\d+))")
 FINAL_EVAL_RE = re.compile(r"^MESSAGE\s+Depth\b.*\|\s+Eval\s+([+-]?(?:M\d+|\d+))\s+\|")
+REALTIME_BEST_RE = re.compile(r"^MESSAGE\s+REALTIME\s+BEST\s+(\d{1,2}),\s*(\d{1,2})\b")
+FINAL_SUMMARY_RE = re.compile(
+    r"^MESSAGE\s+Depth\s+([^|]+?)\s+\|\s+Eval\s+[+-]?(?:M\d+|\d+)\s+\|\s+Time\s+(\d+)ms\b"
+)
+
+MAX_RAPFI_SEARCH_TIME_MS = 15_000
+MAX_TOTAL_ANALYSIS_TIME_MS = 17_000
 
 
 class EngineProtocolError(RuntimeError):
@@ -25,10 +32,20 @@ class EngineProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class RapfiConfig:
     executable: Path
-    time_ms: int = 3000
-    threads: int = 4
-    hash_kib: int = 256 * 1024
+    time_ms: int = 8_000
+    threads: int = 8
+    hash_kib: int = 512 * 1024
     startup_timeout_s: float = 25.0
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.time_ms <= MAX_RAPFI_SEARCH_TIME_MS:
+            raise ValueError(
+                f"Rapfi search time must be between 1 and {MAX_RAPFI_SEARCH_TIME_MS} ms."
+            )
+        if self.threads < 1:
+            raise ValueError("Rapfi thread count must be positive.")
+        if self.hash_kib < 128 * 1024:
+            raise ValueError("Rapfi hash must be at least 128 MiB.")
 
 
 def parse_rapfi_output(
@@ -38,6 +55,9 @@ def parse_rapfi_output(
 
     ranked: dict[int, CandidateMove] = {}
     fallback_point: tuple[int, int] | None = None
+    fallback_variation: tuple[tuple[int, int], ...] = ()
+    realtime_point: tuple[int, int] | None = None
+    realtime_variation: tuple[tuple[int, int], ...] = ()
     final_score: int | None = None
     final_proof = ProofStatus.HEURISTIC
     has_final_evaluation = False
@@ -46,10 +66,17 @@ def parse_rapfi_output(
         line = raw_line.strip()
         if line and re.fullmatch(r"\d{1,2},\d{1,2}", line):
             fallback_point = tuple(map(int, line.split(",")))
+            fallback_variation = (fallback_point,)
+        realtime_match = REALTIME_BEST_RE.match(line)
+        if realtime_match:
+            realtime_point = (int(realtime_match.group(1)), int(realtime_match.group(2)))
         final_eval = FINAL_EVAL_RE.match(line)
         if final_eval:
             final_score, final_proof = _parse_rapfi_score(final_eval.group(1))
             has_final_evaluation = True
+            summary_variation = _parse_output_coordinates(line)
+            if summary_variation:
+                realtime_variation = summary_variation
 
         match = MULTIPV_RE.match(line)
         coordinates = _parse_output_coordinates(line)
@@ -68,6 +95,10 @@ def parse_rapfi_output(
             proof=proof,
             principal_variation=coordinates,
         )
+
+    if fallback_point is None:
+        fallback_point = realtime_point
+        fallback_variation = realtime_variation or ((realtime_point,) if realtime_point else ())
 
     if fallback_point:
         x, y = fallback_point
@@ -95,7 +126,7 @@ def parse_rapfi_output(
                 principal_variation=(
                     current.principal_variation
                     if current is not None and (current.x, current.y) == fallback_point
-                    else ((x, y),)
+                    else fallback_variation or ((x, y),)
                 ),
             )
 
@@ -141,6 +172,19 @@ def _parse_rapfi_score(value: str) -> tuple[int | None, ProofStatus]:
     return score, ProofStatus.HEURISTIC
 
 
+def parse_rapfi_search_summary(output: str) -> tuple[str | None, int | None]:
+    """Return the final iterative-deepening depth and engine-reported time."""
+
+    depth: str | None = None
+    engine_time_ms: int | None = None
+    for raw_line in output.splitlines():
+        match = FINAL_SUMMARY_RE.match(raw_line.strip())
+        if match:
+            depth = match.group(1).strip()
+            engine_time_ms = int(match.group(2))
+    return depth, engine_time_ms
+
+
 def _build_rapfi_search_commands(board: BoardState) -> list[str]:
     """Build a board request with one full-strength Rapfi principal variation."""
 
@@ -169,12 +213,35 @@ class RapfiAnalyzer:
         self._reader_thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._warmed = False
+        self._active_timeout_ms: int | None = None
 
     @property
     def available(self) -> bool:
         return self.config.executable.is_file()
 
-    def analyze(self, board: BoardState, limit: int = 3) -> AnalysisResult:
+    def warm_up(self, timeout_ms: int = MAX_TOTAL_ANALYSIS_TIME_MS) -> None:
+        """Start and configure Rapfi before the player is waiting for a move."""
+
+        deadline = time.monotonic() + min(timeout_ms, MAX_TOTAL_ANALYSIS_TIME_MS) / 1000
+        with self._lock:
+            self._ensure_started(deadline)
+
+    def analyze(
+        self,
+        board: BoardState,
+        limit: int = 3,
+        *,
+        time_ms: int | None = None,
+        total_timeout_ms: int = MAX_TOTAL_ANALYSIS_TIME_MS,
+    ) -> AnalysisResult:
+        requested_time_ms = self.config.time_ms if time_ms is None else time_ms
+        if not 1 <= requested_time_ms <= MAX_RAPFI_SEARCH_TIME_MS:
+            raise ValueError(
+                f"Rapfi search time must be between 1 and {MAX_RAPFI_SEARCH_TIME_MS} ms."
+            )
+        hard_timeout_ms = min(total_timeout_ms, MAX_TOTAL_ANALYSIS_TIME_MS)
+        if hard_timeout_ms < requested_time_ms:
+            raise ValueError("Total analysis time cannot be shorter than the engine search time.")
         if not self.available:
             raise FileNotFoundError(f"Rapfi executable not found: {self.config.executable}")
         if board.size != 15:
@@ -184,13 +251,18 @@ class RapfiAnalyzer:
         if board.is_terminal():
             return AnalysisResult(board=board, candidates=(), engine_name=self.name)
 
+        started_at = time.monotonic()
+        hard_deadline = started_at + hard_timeout_ms / 1000
+
         with self._lock:
-            self._ensure_started()
+            self._ensure_started(hard_deadline)
+            if time.monotonic() >= hard_deadline:
+                raise EngineProtocolError("Rapfi startup used the full 17 second analysis budget.")
             self._discard_pending_messages()
+            self._set_search_timeout(requested_time_ms)
             self._write_commands(_build_rapfi_search_commands(board))
 
-            extra_wait = self.config.startup_timeout_s if not self._warmed else 3.0
-            deadline = time.monotonic() + (self.config.time_ms / 1000) + extra_wait
+            deadline = min(hard_deadline, time.monotonic() + requested_time_ms / 1000)
             output: list[str] = []
             final_move_seen = False
             while time.monotonic() < deadline:
@@ -200,7 +272,7 @@ class RapfiAnalyzer:
                 except queue.Empty:
                     break
                 if line is None:
-                    self.close()
+                    self.close(wait_timeout_s=0)
                     break
                 output.append(line)
                 if re.fullmatch(r"\d{1,2},\d{1,2}", line.strip()):
@@ -210,7 +282,6 @@ class RapfiAnalyzer:
             raw_output = "\n".join(output)
             candidates = parse_rapfi_output(raw_output, board, limit=1)
             if not final_move_seen and not candidates:
-                self.close()
                 raise EngineProtocolError(
                     "Rapfi returned no candidate before the timeout. Output:\n" + raw_output[-2000:]
                 )
@@ -219,20 +290,31 @@ class RapfiAnalyzer:
                 candidates = self._fill_with_tactical_alternatives(board, candidates, limit)
                 engine_name = "Rapfi + tactical alternatives"
             self._warmed = True
+            depth, engine_time_ms = parse_rapfi_search_summary(raw_output)
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
             return AnalysisResult(
                 board=board,
                 candidates=candidates,
                 engine_name=engine_name,
                 raw_output=raw_output,
+                search_stats=SearchStats(
+                    requested_time_ms=requested_time_ms,
+                    elapsed_ms=elapsed_ms,
+                    engine_time_ms=engine_time_ms,
+                    depth=depth,
+                    threads=self.config.threads,
+                    hash_kib=self.config.hash_kib,
+                ),
             )
 
-    def close(self) -> None:
+    def close(self, wait_timeout_s: float = 2.0) -> None:
         with self._lock:
             process = self._process
             self._process = None
             self._reader_thread = None
             self._lines = queue.Queue()
             self._warmed = False
+            self._active_timeout_ms = None
             if process is None:
                 return
             try:
@@ -241,16 +323,22 @@ class RapfiAnalyzer:
                     process.stdin.flush()
             except (BrokenPipeError, OSError):
                 pass
+            if wait_timeout_s <= 0:
+                process.kill()
+                return
             try:
-                process.wait(timeout=2)
+                process.wait(timeout=wait_timeout_s)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=2)
+                try:
+                    process.wait(timeout=wait_timeout_s)
+                except subprocess.TimeoutExpired:
+                    pass
 
-    def _ensure_started(self) -> None:
+    def _ensure_started(self, deadline: float) -> None:
         if self._process is not None and self._process.poll() is None:
             return
-        self.close()
+        self.close(wait_timeout_s=0)
         process = subprocess.Popen(
             [str(self.config.executable)],
             cwd=str(self.config.executable.parent),
@@ -280,11 +368,11 @@ class RapfiAnalyzer:
         self._reader_thread.start()
         self._write_commands(["START 15"])
 
-        deadline = time.monotonic() + self.config.startup_timeout_s
+        startup_deadline = min(deadline, time.monotonic() + self.config.startup_timeout_s)
         startup_output: list[str] = []
-        while time.monotonic() < deadline:
+        while time.monotonic() < startup_deadline:
             try:
-                line = self._lines.get(timeout=max(deadline - time.monotonic(), 0.01))
+                line = self._lines.get(timeout=max(startup_deadline - time.monotonic(), 0.01))
             except queue.Empty:
                 break
             if line is None:
@@ -300,12 +388,19 @@ class RapfiAnalyzer:
                         "YXSHOWINFO",
                     ]
                 )
+                self._active_timeout_ms = self.config.time_ms
                 return
 
-        self.close()
+        self.close(wait_timeout_s=0)
         raise EngineProtocolError(
             "Rapfi did not finish startup. Output:\n" + "\n".join(startup_output)[-2000:]
         )
+
+    def _set_search_timeout(self, time_ms: int) -> None:
+        if self._active_timeout_ms == time_ms:
+            return
+        self._write_commands([f"INFO TIMEOUT_TURN {time_ms}"])
+        self._active_timeout_ms = time_ms
 
     def _write_commands(self, commands: list[str]) -> None:
         if self._process is None or self._process.stdin is None:
@@ -314,7 +409,7 @@ class RapfiAnalyzer:
             self._process.stdin.write("\n".join(commands) + "\n")
             self._process.stdin.flush()
         except (BrokenPipeError, OSError) as error:
-            self.close()
+            self.close(wait_timeout_s=0)
             raise EngineProtocolError("Rapfi process closed its input pipe.") from error
 
     def _discard_pending_messages(self) -> None:

@@ -8,6 +8,7 @@ build/
 dist/
 *.spec
 sessions/
+benchmarks/
 profiles/
 vendor/rapfi/*
 !vendor/rapfi/.gitkeep

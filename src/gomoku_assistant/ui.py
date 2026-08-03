@@ -8,7 +8,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, QSettings, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer
+from .analysis import AnalysisResult, CandidateMove, HeuristicAnalyzer, ProofStatus
 from .capture import (
     BlankFrameError,
     CaptureError,
@@ -42,8 +42,13 @@ from .capture import (
     is_blank_frame,
     list_visible_windows,
 )
-from .domain import BoardState, Stone
-from .engine import RapfiAnalyzer, RapfiConfig
+from .domain import BoardState, Stone, infer_observed_moves
+from .engine import (
+    MAX_RAPFI_SEARCH_TIME_MS,
+    MAX_TOTAL_ANALYSIS_TIME_MS,
+    RapfiAnalyzer,
+    RapfiConfig,
+)
 from .profiles import ProfileStore
 from .sessions import SessionLogger
 from .vision import (
@@ -85,6 +90,8 @@ class BoardCanvas(QWidget):
         self._board = BoardState.empty()
         self._candidates: tuple[CandidateMove, ...] = ()
         self._edit_mode: Stone | None = None
+        self._move_numbers: dict[tuple[int, int], int] = {}
+        self._last_move: tuple[int, int] | None = None
 
     @property
     def board(self) -> BoardState:
@@ -100,6 +107,13 @@ class BoardCanvas(QWidget):
 
     def set_edit_mode(self, stone: Stone | None) -> None:
         self._edit_mode = stone
+
+    def set_move_annotations(
+        self, move_numbers: dict[tuple[int, int], int], last_move: tuple[int, int] | None
+    ) -> None:
+        self._move_numbers = dict(move_numbers)
+        self._last_move = last_move
+        self.update()
 
     def _board_rect(self) -> QRectF:
         margin = 34.0
@@ -181,11 +195,38 @@ class BoardCanvas(QWidget):
                     painter.setPen(QPen(QColor("#a8a8a0"), 1.2))
                 painter.drawEllipse(center, stone_radius, stone_radius)
 
+        if self._last_move is not None and self._board.in_bounds(*self._last_move):
+            center = self._point_to_screen(*self._last_move)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#d4493f"), max(2.0, spacing * 0.055)))
+            painter.drawEllipse(center, stone_radius * 0.78, stone_radius * 0.78)
+
         line = self._board.winning_line()
         if line:
             painter.setPen(QPen(QColor("#267d4b"), max(3.0, spacing * 0.09)))
             painter.drawLine(
                 self._point_to_screen(*line.points[0]), self._point_to_screen(*line.points[-1])
+            )
+
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(max(8, round(stone_radius * 1.08)))
+        painter.setFont(font)
+        for (x, y), number in self._move_numbers.items():
+            if self._board.at(x, y) is Stone.EMPTY:
+                continue
+            center = self._point_to_screen(x, y)
+            color = QColor("#f5d66f") if self._board.at(x, y) is Stone.BLACK else QColor("#5a4630")
+            painter.setPen(QPen(color))
+            painter.drawText(
+                QRectF(
+                    center.x() - stone_radius,
+                    center.y() - stone_radius,
+                    stone_radius * 2,
+                    stone_radius * 2,
+                ),
+                Qt.AlignmentFlag.AlignCenter,
+                str(number),
             )
 
         for candidate in self._candidates:
@@ -361,6 +402,8 @@ class CalibrationDialog(QDialog):
 
 class MainWindow(QMainWindow):
     analysis_ready = Signal(int, object)
+    analysis_finished = Signal()
+    engine_warmed = Signal(int, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -368,6 +411,8 @@ class MainWindow(QMainWindow):
         self.resize(1220, 820)
         self._board = BoardState.empty()
         self._candidates: tuple[CandidateMove, ...] = ()
+        self._move_numbers: dict[tuple[int, int], int] = {}
+        self._last_move: tuple[int, int] | None = None
         self._profile_store = ProfileStore(Path.cwd() / "profiles")
         self._profile: BoardProfile | None = None
         self._last_frame: np.ndarray | None = None
@@ -376,7 +421,11 @@ class MainWindow(QMainWindow):
         self._tracker = StableStateTracker()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._analysis_version = 0
+        self._pending_analyses = 0
+        self._warmup_version = 0
+        self._observation_waiting_for_engine = False
         self._session = SessionLogger(Path.cwd() / "sessions")
+        self._settings = QSettings("Nocoding0", "GomokuTrainingAssistant")
         self._rapfi_path = self._default_rapfi_path()
         self._rapfi_analyzer: RapfiAnalyzer | None = None
 
@@ -408,10 +457,27 @@ class MainWindow(QMainWindow):
         self._engine_button = QPushButton("Select Rapfi.exe")
         self._engine_button.clicked.connect(self.select_rapfi)
 
-        self._search_time = QSpinBox()
-        self._search_time.setRange(100, 10_000)
-        self._search_time.setSingleStep(100)
-        self._search_time.setValue(3000)
+        self._black_search_time = QSpinBox()
+        self._black_search_time.setRange(1, MAX_RAPFI_SEARCH_TIME_MS // 1000)
+        self._black_search_time.setSuffix(" s")
+        self._black_search_time.setValue(self._saved_int("rapfi_black_seconds", 8, 1, 15))
+        self._white_search_time = QSpinBox()
+        self._white_search_time.setRange(1, MAX_RAPFI_SEARCH_TIME_MS // 1000)
+        self._white_search_time.setSuffix(" s")
+        self._white_search_time.setValue(self._saved_int("rapfi_white_seconds", 15, 1, 15))
+        self._rapfi_threads = QSpinBox()
+        self._rapfi_threads.setRange(1, 16)
+        self._rapfi_threads.setValue(self._saved_int("rapfi_threads", 8, 1, 16))
+        self._rapfi_hash = QComboBox()
+        for megabytes in (128, 256, 512, 1024):
+            self._rapfi_hash.addItem(f"{megabytes} MB", megabytes)
+        saved_hash = self._saved_int("rapfi_hash_mb", 512, 128, 1024)
+        hash_index = self._rapfi_hash.findData(saved_hash)
+        self._rapfi_hash.setCurrentIndex(hash_index if hash_index >= 0 else 2)
+        self._black_search_time.valueChanged.connect(self._save_engine_settings)
+        self._white_search_time.valueChanged.connect(self._save_engine_settings)
+        self._rapfi_threads.valueChanged.connect(self._save_engine_settings)
+        self._rapfi_hash.currentIndexChanged.connect(self._save_engine_settings)
         self._edit_mode = QComboBox()
         self._edit_mode.addItem("Auto move", None)
         self._edit_mode.addItem("Place black", Stone.BLACK)
@@ -449,7 +515,10 @@ class MainWindow(QMainWindow):
         controls.addRow("", self._observe_button)
         controls.addRow("Edit board", self._edit_mode)
         controls.addRow("My color", self._my_color)
-        controls.addRow("Rapfi search", self._search_time)
+        controls.addRow("Black search", self._black_search_time)
+        controls.addRow("White search", self._white_search_time)
+        controls.addRow("Rapfi threads", self._rapfi_threads)
+        controls.addRow("Rapfi hash", self._rapfi_hash)
         controls.addRow("", self._engine_button)
         controls.addRow("Engine", self._engine_status)
         controls.addRow("", self._analyze_button)
@@ -477,6 +546,8 @@ class MainWindow(QMainWindow):
         self._capture_timer.setInterval(250)
         self._capture_timer.timeout.connect(self._observe_tick)
         self.analysis_ready.connect(self._on_analysis_ready)
+        self.analysis_finished.connect(self._on_analysis_finished)
+        self.engine_warmed.connect(self._on_engine_warmed)
         self._refresh_shortcut = QShortcut(QKeySequence("F5"), self)
         self._refresh_shortcut.activated.connect(self.refresh_windows)
         self.refresh_windows()
@@ -485,6 +556,69 @@ class MainWindow(QMainWindow):
     def _default_rapfi_path(self) -> Path | None:
         candidate = Path.cwd() / "vendor" / "rapfi" / "Rapfi.exe"
         return candidate if candidate.is_file() else None
+
+    def _saved_int(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self._settings.value(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def _save_engine_settings(self, _: int = 0) -> None:
+        self._settings.setValue("rapfi_black_seconds", self._black_search_time.value())
+        self._settings.setValue("rapfi_white_seconds", self._white_search_time.value())
+        self._settings.setValue("rapfi_threads", self._rapfi_threads.value())
+        self._settings.setValue("rapfi_hash_mb", int(self._rapfi_hash.currentData()))
+
+    def _current_rapfi_config(self) -> RapfiConfig | None:
+        if self._rapfi_path is None or not self._rapfi_path.is_file():
+            return None
+        return RapfiConfig(
+            executable=self._rapfi_path,
+            time_ms=MAX_RAPFI_SEARCH_TIME_MS,
+            threads=self._rapfi_threads.value(),
+            hash_kib=int(self._rapfi_hash.currentData()) * 1024,
+        )
+
+    def _search_budget_ms(self, board: BoardState) -> int:
+        seconds = (
+            self._black_search_time.value()
+            if board.side_to_move() is Stone.BLACK
+            else self._white_search_time.value()
+        )
+        return min(seconds * 1000, MAX_RAPFI_SEARCH_TIME_MS)
+
+    def _set_engine_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self._black_search_time,
+            self._white_search_time,
+            self._rapfi_threads,
+            self._rapfi_hash,
+        ):
+            widget.setEnabled(enabled)
+
+    def _reset_move_history(self, start_new_game: bool = False) -> None:
+        self._move_numbers.clear()
+        self._last_move = None
+        self._board_canvas.set_move_annotations({}, None)
+        if start_new_game:
+            color = self._my_color.currentData()
+            self._session.start_game(color if isinstance(color, Stone) else None)
+
+    def _record_observed_moves(
+        self, previous: BoardState | None, current: BoardState, source: str
+    ) -> None:
+        moves = infer_observed_moves(previous, current)
+        if not moves:
+            return
+        for move in moves:
+            if move.certain and move.number is not None:
+                self._move_numbers[(move.x, move.y)] = move.number
+        numbered = [move for move in moves if move.certain and move.number is not None]
+        latest = max(numbered, key=lambda move: move.number) if numbered else moves[-1]
+        self._last_move = (latest.x, latest.y)
+        self._board_canvas.set_move_annotations(self._move_numbers, self._last_move)
+        self._session.record_moves(moves, source=source)
 
     def _save_profile(self) -> None:
         if self._profile is None:
@@ -540,6 +674,7 @@ class MainWindow(QMainWindow):
         self._last_frame = None
         self._last_window = None
         self._tracker.reset()
+        self._reset_move_history()
         self._set_board(BoardState.empty(), analyze=False)
         self._candidate_text.setText("No analysis yet")
         self._preview.setPixmap(QPixmap())
@@ -694,18 +829,67 @@ class MainWindow(QMainWindow):
                     "The selected window or capture size changed. Capture a frame and calibrate again.",
                 )
                 return
-        self._observe_button.setText("Stop observing" if enabled else "Start observing")
-        self._clear_button.setText("Resync board" if enabled else "Clear board")
         if enabled:
             self._tracker.reset()
             self._set_board(BoardState.empty(), analyze=False)
-            self._candidate_text.setText("Waiting for a stable board frame.")
-            self._capture_timer.start()
-            self._status.setText("Observing target window.")
+            self._reset_move_history(start_new_game=True)
+            config = self._current_rapfi_config()
+            if config is None:
+                self._begin_observation()
+                return
+            if self._rapfi_analyzer is None or self._rapfi_analyzer.config != config:
+                if self._rapfi_analyzer is not None:
+                    self._rapfi_analyzer.close(wait_timeout_s=0)
+                self._rapfi_analyzer = RapfiAnalyzer(config)
+            self._observation_waiting_for_engine = True
+            self._warmup_version += 1
+            version = self._warmup_version
+            self._observe_button.setText("Preparing engine...")
+            self._clear_button.setText("Resync board")
+            self._candidate_text.setText("Preparing Rapfi before observation starts.")
+            self._status.setText("Starting Rapfi before the move clock begins.")
+            self._set_engine_controls_enabled(False)
+            future = self._executor.submit(self._rapfi_analyzer.warm_up)
+
+            def warmed(task: concurrent.futures.Future[None]) -> None:
+                try:
+                    payload: object = task.result()
+                except Exception as error:
+                    payload = error
+                self.engine_warmed.emit(version, payload)
+
+            future.add_done_callback(warmed)
         else:
+            self._warmup_version += 1
+            self._observation_waiting_for_engine = False
             self._capture_timer.stop()
             self._invalidate_analysis()
+            self._observe_button.setText("Start observing")
+            self._clear_button.setText("Clear board")
+            if self._pending_analyses == 0:
+                self._set_engine_controls_enabled(True)
             self._status.setText("Observation paused.")
+
+    def _begin_observation(self) -> None:
+        self._observation_waiting_for_engine = False
+        self._observe_button.setText("Stop observing")
+        self._clear_button.setText("Resync board")
+        self._candidate_text.setText("Waiting for a stable board frame.")
+        self._capture_timer.start()
+        self._set_engine_controls_enabled(True)
+        self._status.setText("Observing target window.")
+
+    def _on_engine_warmed(self, version: int, payload: object) -> None:
+        if version != self._warmup_version or not self._observe_button.isChecked():
+            return
+        self._set_engine_controls_enabled(True)
+        if isinstance(payload, Exception):
+            self._observation_waiting_for_engine = False
+            self._observe_button.setChecked(False)
+            self._candidate_text.setText(f"Engine warm-up failed: {payload}")
+            self._status.setText("Rapfi was not ready; observation did not start.")
+            return
+        self._begin_observation()
 
     def _observe_tick(self) -> None:
         if self._profile is None:
@@ -720,9 +904,24 @@ class MainWindow(QMainWindow):
             self._status.setText(f"Recognition paused: {error}")
             return
         if committed is not None:
-            should_analyze = self._should_analyze_turn(committed)
+            previous = self._board
+            if transition.reason == "new game detected":
+                self._reset_move_history(start_new_game=True)
+                previous = BoardState.empty()
+            self._record_observed_moves(previous, committed, source="vision")
+            is_terminal = committed.is_terminal()
+            should_analyze = not is_terminal and self._should_analyze_turn(committed)
             self._set_board(committed, analyze=should_analyze)
             black, white = committed.counts()
+            if is_terminal:
+                self._session.finish_game(committed)
+                winner = committed.winner()
+                self._candidate_text.setText(
+                    "Game over: "
+                    + ("Black wins." if winner is Stone.BLACK else "White wins." if winner else "Draw.")
+                )
+                self._status.setText(f"Synced B{black}/W{white}; game finished.")
+                return
             next_side = "Black" if committed.side_to_move() is Stone.BLACK else "White"
             if should_analyze:
                 self._status.setText(
@@ -765,6 +964,7 @@ class MainWindow(QMainWindow):
         if not self._observe_button.isChecked():
             return
         self._tracker.reset()
+        self._reset_move_history()
         self._set_board(BoardState.empty(), analyze=False)
         selected = self._my_color.currentText()
         self._candidate_text.setText("Color changed. Waiting for a stable board frame.")
@@ -775,7 +975,15 @@ class MainWindow(QMainWindow):
         self._board_canvas.set_edit_mode(value)
 
     def _on_manual_board_edit(self, board: BoardState) -> None:
+        previous = self._board
+        moves = infer_observed_moves(previous, board)
+        if moves:
+            self._record_observed_moves(previous, board, source="manual")
+        elif board != previous:
+            self._reset_move_history()
         self._set_board(board, analyze=False)
+        if board.is_terminal():
+            self._session.finish_game(board)
         self._status.setText("Manual board edited. Select Analyze position when ready.")
 
     def _set_board(self, board: BoardState, analyze: bool) -> None:
@@ -801,6 +1009,7 @@ class MainWindow(QMainWindow):
             self._status.setText("Resynchronizing current board from stable frames.")
             return
         self._tracker.reset()
+        self._reset_move_history(start_new_game=True)
         self._set_board(BoardState.empty(), analyze=False)
         self._candidate_text.setText("No analysis yet")
         self._status.setText("Board cleared.")
@@ -827,6 +1036,7 @@ class MainWindow(QMainWindow):
             self._status.setText("Cannot analyze: black/white counts are invalid.")
             return
         if self._board.is_terminal():
+            self._session.finish_game(self._board)
             winner = self._board.winner()
             self._candidate_text.setText(
                 "Game over: " + ("Black wins." if winner is Stone.BLACK else "White wins." if winner else "Draw.")
@@ -836,18 +1046,35 @@ class MainWindow(QMainWindow):
         board = self._board
         self._analysis_version += 1
         version = self._analysis_version
-        self._status.setText("Analyzing...")
-        if self._rapfi_path and self._rapfi_path.is_file():
-            config = RapfiConfig(executable=self._rapfi_path, time_ms=self._search_time.value())
+        config = self._current_rapfi_config()
+        search_budget_ms = self._search_budget_ms(board)
+        if config is not None:
             if self._rapfi_analyzer is None or self._rapfi_analyzer.config != config:
                 if self._rapfi_analyzer is not None:
                     self._rapfi_analyzer.close()
                 self._rapfi_analyzer = RapfiAnalyzer(config)
             analyzer: Any = self._rapfi_analyzer
+            side = "Black" if board.side_to_move() is Stone.BLACK else "White"
+            self._status.setText(
+                f"Analyzing {side}: up to {search_budget_ms / 1000:.0f}s engine time, "
+                f"{MAX_TOTAL_ANALYSIS_TIME_MS / 1000:.0f}s total limit."
+            )
         else:
             analyzer = HeuristicAnalyzer()
+            self._status.setText("Analyzing with local tactical heuristic...")
 
-        future = self._executor.submit(analyzer.analyze, board, 3)
+        self._pending_analyses += 1
+        self._set_engine_controls_enabled(False)
+        if isinstance(analyzer, RapfiAnalyzer):
+            future = self._executor.submit(
+                analyzer.analyze,
+                board,
+                3,
+                time_ms=search_budget_ms,
+                total_timeout_ms=MAX_TOTAL_ANALYSIS_TIME_MS,
+            )
+        else:
+            future = self._executor.submit(analyzer.analyze, board, 3)
 
         def completed(task: concurrent.futures.Future[AnalysisResult]) -> None:
             try:
@@ -855,8 +1082,14 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 result = error
             self.analysis_ready.emit(version, result)
+            self.analysis_finished.emit()
 
         future.add_done_callback(completed)
+
+    def _on_analysis_finished(self) -> None:
+        self._pending_analyses = max(0, self._pending_analyses - 1)
+        if self._pending_analyses == 0 and not self._observation_waiting_for_engine:
+            self._set_engine_controls_enabled(True)
 
     def _on_analysis_ready(self, version: int, payload: object) -> None:
         if version != self._analysis_version:
@@ -876,15 +1109,33 @@ class MainWindow(QMainWindow):
         if not result.candidates:
             self._candidate_text.setText(f"{result.engine_name}: no legal move.")
             return
-        self._candidate_text.setText(
+        lines: list[str] = []
+        if result.candidates[0].proof is ProofStatus.FORCED_LOSS:
+            lines.append("Rapfi currently reports a forced loss. Only an opponent mistake can recover it.")
+        lines.extend(
             "\n".join(
                 f"{move.rank}. {self._board.coordinate_name(move.x, move.y)}"
                 f"  {self._candidate_label(move, result)}"
                 f"  {move.proof.value}"
                 for move in result.candidates
-            )
-            + f"\nEngine: {result.engine_name}"
+            ).splitlines()
         )
+        lines.append(f"Engine: {result.engine_name}")
+        if result.search_stats is not None:
+            stats = result.search_stats
+            details = [
+                f"Search: {stats.elapsed_ms}ms / {stats.requested_time_ms}ms budget",
+            ]
+            if stats.engine_time_ms is not None:
+                details.append(f"engine {stats.engine_time_ms}ms")
+            if stats.depth is not None:
+                details.append(f"depth {stats.depth}")
+            if stats.threads is not None:
+                details.append(f"{stats.threads} threads")
+            if stats.hash_kib is not None:
+                details.append(f"{stats.hash_kib // 1024}MB hash")
+            lines.append("; ".join(details))
+        self._candidate_text.setText("\n".join(lines))
         self._status.setText(f"Analysis ready from {result.engine_name}.")
 
     @staticmethod
