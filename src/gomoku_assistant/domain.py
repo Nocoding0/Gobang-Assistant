@@ -157,6 +157,109 @@ class ObservedMove:
     certain: bool
 
 
+@dataclass(frozen=True)
+class CorrectionEvent:
+    """A user-confirmed correction applied above the visual board state."""
+
+    x: int
+    y: int
+    before: Stone
+    after: Stone
+    vision: Stone
+    action: str
+
+
+@dataclass(frozen=True)
+class _CorrectionOperation:
+    point: tuple[int, int]
+    previous_override: Stone | None
+    next_override: Stone | None
+    event: CorrectionEvent
+
+
+class BoardCorrectionState:
+    """Persistent per-game visual overrides with recoverable user actions."""
+
+    def __init__(self) -> None:
+        self._overrides: dict[tuple[int, int], Stone] = {}
+        self._history: list[_CorrectionOperation] = []
+
+    @property
+    def overrides(self) -> dict[tuple[int, int], Stone]:
+        return dict(self._overrides)
+
+    @property
+    def points(self) -> tuple[tuple[int, int], ...]:
+        return tuple(self._overrides)
+
+    @property
+    def count(self) -> int:
+        return len(self._overrides)
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._history)
+
+    def apply(self, board: BoardState) -> BoardState:
+        corrected = board
+        for (x, y), stone in self._overrides.items():
+            corrected = corrected.set_cell(x, y, stone)
+        return corrected
+
+    def set_cell(self, board: BoardState, x: int, y: int, stone: Stone) -> CorrectionEvent | None:
+        """Set one effective cell, removing its override when vision already agrees."""
+
+        if not board.in_bounds(x, y):
+            raise IndexError(f"Point outside board: {x},{y}")
+        point = (x, y)
+        vision = board.at(x, y)
+        previous_override = self._overrides.get(point)
+        before = previous_override if previous_override is not None else vision
+        next_override = None if stone is vision else stone
+        if previous_override is next_override:
+            return None
+        if next_override is None:
+            self._overrides.pop(point, None)
+            action = "follow_vision"
+        else:
+            self._overrides[point] = next_override
+            if before is Stone.EMPTY and stone is not Stone.EMPTY:
+                action = "add"
+            elif before is not Stone.EMPTY and stone is Stone.EMPTY:
+                action = "erase"
+            else:
+                action = "recolor"
+        event = CorrectionEvent(x, y, before, stone, vision, action)
+        self._history.append(_CorrectionOperation(point, previous_override, next_override, event))
+        return event
+
+    def undo(self, board: BoardState) -> CorrectionEvent | None:
+        if not self._history:
+            return None
+        operation = self._history.pop()
+        if operation.previous_override is None:
+            self._overrides.pop(operation.point, None)
+        else:
+            self._overrides[operation.point] = operation.previous_override
+        x, y = operation.point
+        current = operation.next_override if operation.next_override is not None else board.at(x, y)
+        restored = (
+            operation.previous_override
+            if operation.previous_override is not None
+            else board.at(x, y)
+        )
+        return CorrectionEvent(x, y, current, restored, board.at(x, y), "undo")
+
+    def clear(self) -> tuple[CorrectionEvent, ...]:
+        events = tuple(
+            CorrectionEvent(x, y, stone, Stone.EMPTY, Stone.EMPTY, "clear")
+            for (x, y), stone in self._overrides.items()
+        )
+        self._overrides.clear()
+        self._history.clear()
+        return events
+
+
 def infer_observed_moves(
     previous: BoardState | None, current: BoardState
 ) -> tuple[ObservedMove, ...]:

@@ -1,4 +1,5 @@
 from gomoku_assistant.domain import (
+    BoardCorrectionState,
     BoardState,
     Stone,
     infer_observed_moves,
@@ -121,3 +122,23 @@ def test_observed_moves_do_not_invent_order_for_same_color_catch_up() -> None:
         (8, 2, True),
         (9, None, False),
     }
+
+
+def test_manual_correction_persists_until_undone() -> None:
+    board = BoardState.empty()
+    corrections = BoardCorrectionState()
+
+    event = corrections.set_cell(board, 7, 7, Stone.BLACK)
+
+    assert event is not None
+    assert event.action == "add"
+    assert corrections.apply(board).at(7, 7) is Stone.BLACK
+
+    later_vision = board.set_cell(8, 7, Stone.WHITE)
+    assert corrections.apply(later_vision).counts() == (1, 1)
+
+    undone = corrections.undo(later_vision)
+
+    assert undone is not None
+    assert corrections.apply(later_vision).at(7, 7) is Stone.EMPTY
+    assert corrections.count == 0

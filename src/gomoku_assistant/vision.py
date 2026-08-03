@@ -153,6 +153,39 @@ class RecognitionResult:
     grid_score: float
     warped: np.ndarray = field(repr=False, compare=False)
     obstruction_reason: str | None = None
+    cell_evidence: tuple["CellEvidence", ...] = ()
+    ambiguous_points: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class CellEvidence:
+    """Normalized support for the three possible values of one board cell."""
+
+    black: float
+    white: float
+    empty: float
+
+    @property
+    def stone(self) -> Stone:
+        choices = ((self.empty, Stone.EMPTY), (self.black, Stone.BLACK), (self.white, Stone.WHITE))
+        return max(choices, key=lambda choice: choice[0])[1]
+
+    @property
+    def confidence(self) -> float:
+        return max(self.black, self.white, self.empty)
+
+    @property
+    def margin(self) -> float:
+        values = sorted((self.black, self.white, self.empty), reverse=True)
+        return values[0] - values[1]
+
+    def runner_up(self) -> Stone:
+        choices = sorted(
+            ((self.empty, Stone.EMPTY), (self.black, Stone.BLACK), (self.white, Stone.WHITE)),
+            key=lambda choice: choice[0],
+            reverse=True,
+        )
+        return choices[1][1]
 
 
 @dataclass(frozen=True)
@@ -254,118 +287,35 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
     grid_score = grid_assessment.score
     board_visible = grid_score >= profile.grid_visibility_threshold
     obstruction_reason = assess_obstruction(warped, spacing, profile)
-    radius = max(int(spacing * 0.36), 7)
+    radius = max(int(spacing * 0.52), 10)
     inner_radius = max(int(spacing * 0.16), 3)
     stone_radius = max(int(spacing * 0.30), 6)
 
     cells: list[Stone] = []
     confidences: list[float] = []
+    evidence: list[CellEvidence] = []
+    ambiguous_points: list[tuple[int, int]] = []
     for y in range(profile.board_size):
         for x in range(profile.board_size):
             center_x = round(x * spacing)
             center_y = round(y * spacing)
-            gray_patch, hsv_patch, distances = _circular_patch(
-                gray, hsv, center_x, center_y, radius
+            cell_evidence = _classify_intersection(
+                gray,
+                hsv,
+                profile,
+                x,
+                y,
+                center_x,
+                center_y,
+                radius,
+                inner_radius,
+                stone_radius,
             )
-            inner_mask = distances <= inner_radius**2
-            outer_mask = (distances >= inner_radius**2) & (distances <= stone_radius**2)
-            disk_mask = distances <= stone_radius**2
-            if not np.any(outer_mask) or not np.any(disk_mask):
-                cells.append(Stone.EMPTY)
-                confidences.append(0.0)
-                continue
-
-            dark_mask = gray_patch <= profile.black_gray_max
-            white_mask = (gray_patch >= profile.white_gray_min) & (
-                hsv_patch[..., 1] <= profile.white_saturation_max
-            )
-            marker_mask = (
-                (hsv_patch[..., 0] >= MARKER_HUE_MIN)
-                & (hsv_patch[..., 0] <= MARKER_HUE_MAX)
-                & (hsv_patch[..., 1] >= MARKER_SATURATION_MIN)
-                & (hsv_patch[..., 2] >= MARKER_VALUE_MIN)
-            )
-            dark_inner = float(np.mean(dark_mask[inner_mask])) if np.any(inner_mask) else 0.0
-            dark_outer = float(np.mean(dark_mask[outer_mask]))
-            white_inner = float(np.mean(white_mask[inner_mask])) if np.any(inner_mask) else 0.0
-            white_outer = float(np.mean(white_mask[outer_mask]))
-            dark_disk = float(np.mean(dark_mask[disk_mask]))
-            white_disk = float(np.mean(white_mask[disk_mask]))
-            marker_inner = float(np.mean(marker_mask[inner_mask])) if np.any(inner_mask) else 0.0
-            black_round = _centered_round_mask(dark_mask & disk_mask)
-            white_round = _centered_round_mask(white_mask & disk_mask)
-            dark_pixels = dark_mask & disk_mask
-            dark_low_saturation = (
-                float(np.mean(hsv_patch[..., 1][dark_pixels] <= profile.black_saturation_max))
-                if np.any(dark_pixels)
-                else 0.0
-            )
-            is_edge = x in (0, profile.board_size - 1) or y in (0, profile.board_size - 1)
-            marker_black_strength = min(
-                marker_inner / MARKER_INNER_FRACTION_MIN,
-                dark_outer / MARKER_BLACK_OUTER_MIN,
-                dark_disk / MARKER_BLACK_DISK_MIN,
-                dark_low_saturation / MARKER_BLACK_LOW_SATURATION_MIN,
-            )
-            marker_black = marker_black_strength >= 1.0
-            edge_black_strength = min(
-                dark_inner / EDGE_BLACK_INNER_MIN,
-                dark_outer / EDGE_BLACK_OUTER_MIN,
-                dark_disk / EDGE_BLACK_DISK_MIN,
-                dark_low_saturation / profile.black_low_saturation_fraction_min,
-            )
-            edge_white_strength = min(
-                white_inner / EDGE_WHITE_INNER_MIN,
-                white_outer / EDGE_WHITE_OUTER_MIN,
-                white_disk / EDGE_WHITE_DISK_MIN,
-            )
-            normal_black_strength = (
-                min(
-                    dark_disk / profile.black_disk_fraction_min,
-                    dark_low_saturation / profile.black_low_saturation_fraction_min,
-                )
-                if black_round
-                else 0.0
-            )
-            normal_white_strength = (
-                white_disk / profile.white_disk_fraction_min if white_round else 0.0
-            )
-
-            if is_edge:
-                black_detected = edge_black_strength >= 1.0 or marker_black
-                white_detected = edge_white_strength >= 1.0
-                black_strength = max(edge_black_strength, marker_black_strength)
-                white_strength = edge_white_strength
-            else:
-                black_detected = (
-                    black_round
-                    and dark_low_saturation >= profile.black_low_saturation_fraction_min
-                    and (
-                        (
-                            dark_inner >= profile.black_fraction_min
-                            or dark_outer >= 0.28
-                        )
-                        and normal_black_strength >= 1.0
-                        or marker_black
-                    )
-                )
-                white_detected = (
-                    (white_inner >= profile.white_fraction_min or white_outer >= 0.36)
-                    and normal_white_strength >= 1.0
-                )
-                black_strength = max(normal_black_strength, marker_black_strength)
-                white_strength = normal_white_strength
-
-            if black_detected:
-                cells.append(Stone.BLACK)
-                confidences.append(min(1.0, black_strength))
-            elif white_detected:
-                cells.append(Stone.WHITE)
-                confidences.append(min(1.0, white_strength))
-            else:
-                cells.append(Stone.EMPTY)
-                candidate_strength = min(1.0, max(black_strength, white_strength))
-                confidences.append(1.0 - candidate_strength**2)
+            cells.append(cell_evidence.stone)
+            confidences.append(cell_evidence.confidence)
+            evidence.append(cell_evidence)
+            if cell_evidence.margin < 0.20:
+                ambiguous_points.append((x, y))
 
     return RecognitionResult(
         board=BoardState(size=profile.board_size, cells=tuple(cells)),
@@ -375,7 +325,179 @@ def recognize_frame(frame_bgr: np.ndarray, profile: BoardProfile) -> Recognition
         grid_score=grid_score,
         warped=warped,
         obstruction_reason=obstruction_reason,
+        cell_evidence=tuple(evidence),
+        ambiguous_points=tuple(ambiguous_points),
     )
+
+
+def _classify_intersection(
+    gray: np.ndarray,
+    hsv: np.ndarray,
+    profile: BoardProfile,
+    x: int,
+    y: int,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    inner_radius: int,
+    stone_radius: int,
+) -> CellEvidence:
+    """Evaluate a grid point and tolerate a small calibration-center error."""
+
+    base = _classify_at_center(
+        gray, hsv, profile, x, y, center_x, center_y, radius, inner_radius, stone_radius
+    )
+    is_edge = x in (0, profile.board_size - 1) or y in (0, profile.board_size - 1)
+    # The normal case is a clear center classification. Searching every one of
+    # 225 intersections would make the 250ms observation loop lag noticeably.
+    if not is_edge and base.margin >= 0.45:
+        return base
+    offset = max(1, round(profile.spacing * 0.08))
+    best = base
+    best_stone_score = max(base.black, base.white)
+    for offset_x, offset_y in ((-offset, 0), (offset, 0), (0, -offset), (0, offset)):
+        candidate = _classify_at_center(
+            gray,
+            hsv,
+            profile,
+            x,
+            y,
+            center_x + offset_x,
+            center_y + offset_y,
+            radius,
+            inner_radius,
+            stone_radius,
+        )
+        candidate_score = max(candidate.black, candidate.white) - 0.05
+        if candidate.stone is not Stone.EMPTY and candidate_score > best_stone_score:
+            best = candidate
+            best_stone_score = candidate_score
+    return best
+
+
+def _classify_at_center(
+    gray: np.ndarray,
+    hsv: np.ndarray,
+    profile: BoardProfile,
+    x: int,
+    y: int,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    inner_radius: int,
+    stone_radius: int,
+) -> CellEvidence:
+    gray_patch, hsv_patch, distances = _circular_patch(gray, hsv, center_x, center_y, radius)
+    inner_mask = distances <= inner_radius**2
+    outer_mask = (distances >= inner_radius**2) & (distances <= stone_radius**2)
+    disk_mask = distances <= stone_radius**2
+    if not np.any(outer_mask) or not np.any(disk_mask):
+        return CellEvidence(black=0.0, white=0.0, empty=1.0)
+
+    dark_mask = gray_patch <= profile.black_gray_max
+    white_mask = (gray_patch >= profile.white_gray_min) & (
+        hsv_patch[..., 1] <= profile.white_saturation_max
+    )
+    marker_mask = (
+        (hsv_patch[..., 0] >= MARKER_HUE_MIN)
+        & (hsv_patch[..., 0] <= MARKER_HUE_MAX)
+        & (hsv_patch[..., 1] >= MARKER_SATURATION_MIN)
+        & (hsv_patch[..., 2] >= MARKER_VALUE_MIN)
+    )
+    dark_inner = float(np.mean(dark_mask[inner_mask])) if np.any(inner_mask) else 0.0
+    dark_outer = float(np.mean(dark_mask[outer_mask]))
+    white_inner = float(np.mean(white_mask[inner_mask])) if np.any(inner_mask) else 0.0
+    white_outer = float(np.mean(white_mask[outer_mask]))
+    dark_disk = float(np.mean(dark_mask[disk_mask]))
+    white_disk = float(np.mean(white_mask[disk_mask]))
+    marker_inner = float(np.mean(marker_mask[inner_mask])) if np.any(inner_mask) else 0.0
+    dark_pixels = dark_mask & disk_mask
+    dark_low_saturation = (
+        float(np.mean(hsv_patch[..., 1][dark_pixels] <= profile.black_saturation_max))
+        if np.any(dark_pixels)
+        else 0.0
+    )
+
+    background_mask = (distances >= round(stone_radius * 1.22) ** 2) & (distances <= radius**2)
+    background_gray = (
+        float(np.median(gray_patch[background_mask])) if np.any(background_mask) else float(np.median(gray_patch))
+    )
+    disk_gray = float(np.median(gray_patch[disk_mask]))
+    relative_dark_mask = (gray_patch <= background_gray - 16.0) & disk_mask
+    relative_light_mask = (gray_patch >= background_gray + 14.0) & disk_mask
+    relative_black_round = _centered_round_mask(relative_dark_mask)
+    relative_white_round = _centered_round_mask(relative_light_mask)
+    relative_dark_low_saturation = (
+        float(np.mean(hsv_patch[..., 1][relative_dark_mask] <= profile.black_saturation_max))
+        if np.any(relative_dark_mask)
+        else 0.0
+    )
+    relative_black_strength = (
+        min(
+            max(0.0, (background_gray - disk_gray - 8.0) / 24.0),
+            float(np.mean(relative_dark_mask[disk_mask])) / 0.42,
+            relative_dark_low_saturation / profile.black_low_saturation_fraction_min,
+        )
+        if relative_black_round
+        else 0.0
+    )
+    relative_white_strength = (
+        min(
+            max(0.0, (disk_gray - background_gray - 6.0) / 22.0),
+            float(np.mean(relative_light_mask[disk_mask])) / 0.42,
+        )
+        if relative_white_round
+        else 0.0
+    )
+
+    black_round = _centered_round_mask(dark_mask & disk_mask) or relative_black_round
+    white_round = _centered_round_mask(white_mask & disk_mask) or relative_white_round
+    is_edge = x in (0, profile.board_size - 1) or y in (0, profile.board_size - 1)
+    marker_black_strength = min(
+        marker_inner / MARKER_INNER_FRACTION_MIN,
+        dark_outer / MARKER_BLACK_OUTER_MIN,
+        dark_disk / MARKER_BLACK_DISK_MIN,
+        dark_low_saturation / MARKER_BLACK_LOW_SATURATION_MIN,
+    )
+    marker_black = marker_black_strength >= 1.0
+    edge_black_strength = min(
+        dark_inner / EDGE_BLACK_INNER_MIN,
+        dark_outer / EDGE_BLACK_OUTER_MIN,
+        dark_disk / EDGE_BLACK_DISK_MIN,
+        dark_low_saturation / profile.black_low_saturation_fraction_min,
+    )
+    edge_white_strength = min(
+        white_inner / EDGE_WHITE_INNER_MIN,
+        white_outer / EDGE_WHITE_OUTER_MIN,
+        white_disk / EDGE_WHITE_DISK_MIN,
+    )
+    normal_black_strength = (
+        min(
+            dark_disk / profile.black_disk_fraction_min,
+            dark_low_saturation / profile.black_low_saturation_fraction_min,
+        )
+        if black_round
+        else 0.0
+    )
+    normal_white_strength = white_disk / profile.white_disk_fraction_min if white_round else 0.0
+
+    if is_edge:
+        black_strength = max(edge_black_strength, marker_black_strength, relative_black_strength)
+        white_strength = max(edge_white_strength, relative_white_strength)
+        black_detected = black_strength >= 1.0 or marker_black
+        white_detected = white_strength >= 1.0
+    else:
+        black_strength = max(normal_black_strength, marker_black_strength, relative_black_strength)
+        white_strength = max(normal_white_strength, relative_white_strength)
+        black_detected = (black_strength >= 1.0 and black_round) or marker_black
+        white_detected = white_strength >= 1.0 and white_round
+
+    black_score = min(1.0, max(0.0, black_strength))
+    white_score = min(1.0, max(0.0, white_strength))
+    empty_score = max(0.0, 1.0 - max(black_score, white_score))
+    if black_detected or white_detected:
+        empty_score = min(empty_score, 0.18)
+    return CellEvidence(black=black_score, white=white_score, empty=empty_score)
 
 
 def _circular_patch(
@@ -518,7 +640,7 @@ def _directional_grid_score(
 
 
 class StableStateTracker:
-    """Commits only repeated frames that form a legal new board state."""
+    """Commits stable visual evidence that forms a legal new board state."""
 
     def __init__(
         self,
@@ -531,7 +653,7 @@ class StableStateTracker:
         self.required_frames = required_frames
         self.min_confidence = min_confidence
         self.reset_frames = reset_frames
-        self._samples: list[BoardState] = []
+        self._samples: list[RecognitionResult] = []
         self._reset_samples: list[BoardState] = []
         self.committed: BoardState | None = None
 
@@ -539,6 +661,13 @@ class StableStateTracker:
         self._samples.clear()
         self._reset_samples.clear()
         self.committed = None
+
+    def rebase(self, board: BoardState) -> None:
+        """Accept an explicit user correction as the next transition baseline."""
+
+        self._samples.clear()
+        self._reset_samples.clear()
+        self.committed = board
 
     def observe(self, result: RecognitionResult) -> tuple[TransitionResult, BoardState | None]:
         if result.obstruction_reason is not None:
@@ -553,15 +682,30 @@ class StableStateTracker:
             self._samples.clear()
             return TransitionResult(False, False, "recognition confidence is too low"), None
 
-        self._samples.append(result.board)
+        self._samples.append(result)
         self._samples = self._samples[-self.required_frames :]
         if len(self._samples) < self.required_frames:
             return TransitionResult(True, False, "waiting for stable frames"), None
-        if len(set(sample.cells for sample in self._samples)) != 1:
+
+        candidate, evidence, stable = self._fuse_samples()
+        if not stable:
             return TransitionResult(True, False, "frames are not stable"), None
 
-        candidate = self._samples[-1]
         transition = validate_transition(self.committed, candidate)
+        repaired = False
+        if not transition.valid:
+            repaired_candidate, repaired_transition = self._unique_legal_repair(candidate, evidence)
+            if repaired_candidate is not None and repaired_transition is not None:
+                candidate = repaired_candidate
+                transition = TransitionResult(
+                    True,
+                    repaired_transition.changed,
+                    f"{repaired_transition.reason}; repaired one ambiguous visual cell",
+                    repaired_transition.added_count,
+                )
+                repaired = True
+            elif repaired_transition is not None:
+                transition = repaired_transition
         if transition.valid and transition.changed:
             self._reset_samples.clear()
             self.committed = candidate
@@ -578,4 +722,73 @@ class StableStateTracker:
             ) == 1:
                 self.committed = candidate
                 return TransitionResult(True, True, "new game detected", sum(candidate.counts())), candidate
+        if not transition.valid and not repaired:
+            return transition, None
         return transition, None
+
+    def _fuse_samples(self) -> tuple[BoardState, tuple[CellEvidence, ...], bool]:
+        size = self._samples[-1].board.size
+        required_votes = len(self._samples) // 2 + 1
+        cells: list[Stone] = []
+        evidence: list[CellEvidence] = []
+        stable = True
+        for index in range(size * size):
+            samples = tuple(self._evidence_at(sample, index) for sample in self._samples)
+            fused = CellEvidence(
+                black=float(np.mean([sample.black for sample in samples])),
+                white=float(np.mean([sample.white for sample in samples])),
+                empty=float(np.mean([sample.empty for sample in samples])),
+            )
+            winner = fused.stone
+            if sum(sample.stone is winner for sample in samples) < required_votes:
+                stable = False
+            cells.append(winner)
+            evidence.append(fused)
+        return BoardState(size=size, cells=tuple(cells)), tuple(evidence), stable
+
+    @staticmethod
+    def _evidence_at(result: RecognitionResult, index: int) -> CellEvidence:
+        if len(result.cell_evidence) == len(result.board.cells):
+            return result.cell_evidence[index]
+        confidence = (
+            result.cell_confidences[index]
+            if len(result.cell_confidences) == len(result.board.cells)
+            else result.confidence
+        )
+        confidence = min(1.0, max(0.0, confidence))
+        remainder = (1.0 - confidence) / 2.0
+        stone = result.board.cells[index]
+        if stone is Stone.BLACK:
+            return CellEvidence(confidence, remainder, remainder)
+        if stone is Stone.WHITE:
+            return CellEvidence(remainder, confidence, remainder)
+        return CellEvidence(remainder, remainder, confidence)
+
+    def _unique_legal_repair(
+        self, candidate: BoardState, evidence: tuple[CellEvidence, ...]
+    ) -> tuple[BoardState | None, TransitionResult | None]:
+        alternatives: list[tuple[BoardState, TransitionResult]] = []
+        for index, cell in enumerate(evidence):
+            if cell.margin > 0.25:
+                continue
+            runner_up = cell.runner_up()
+            runner_up_score = {
+                Stone.BLACK: cell.black,
+                Stone.WHITE: cell.white,
+                Stone.EMPTY: cell.empty,
+            }[runner_up]
+            if runner_up_score < 0.58:
+                continue
+            x = index % candidate.size
+            y = index // candidate.size
+            if runner_up is candidate.at(x, y):
+                continue
+            alternative = candidate.set_cell(x, y, runner_up)
+            transition = validate_transition(self.committed, alternative)
+            if transition.valid:
+                alternatives.append((alternative, transition))
+        if len(alternatives) == 1:
+            return alternatives[0]
+        if len(alternatives) > 1:
+            return None, TransitionResult(False, False, "multiple ambiguous visual repairs")
+        return None, None

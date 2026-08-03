@@ -70,8 +70,10 @@ To test the engine without screen recognition, place stones on the left board an
   Import a local screenshot for recognition debugging.
 - `Calibrate`: 保存四个角点构成的棋盘坐标映射，文件位于 `profiles/default.json`。  
   Save the four-corner board mapping in `profiles/default.json`.
-- `Edit board`: 设置手工摆子的方式；`Auto move` 会按照黑白正常轮次落子。  
-  Set manual editing behavior; `Auto move` follows the normal black/white turn order.
+- `Manual correction`: 选择 `Place black`、`Place white` 或 `Erase` 后点击助手棋盘交叉点，修正后的局面会立即用于分析。`Off` 可防止误点，`Auto move` 适合离线手工摆局。
+  Choose `Place black`, `Place white`, or `Erase`, then click an assistant-board intersection. The corrected position is used for analysis immediately. `Off` prevents accidental edits; `Auto move` is for offline manual setup.
+- `Undo correction` / `Clear corrections`: 撤销最近一次修正，或放弃本局全部人工覆盖并重新从稳定画面同步。青色圈表示人工修正，黄色虚线框表示视觉低置信度格。
+  Undo the latest correction, or discard all per-game overrides and resynchronize from stable frames. Cyan circles mark manual corrections; yellow dashed squares mark low-confidence visual cells.
 - `My color`: 每局开始前选择自己执黑、执白或双方分析。棋盘始终同步双方落子，但只有轮到你的棋色时才显示推荐。
   Choose black, white, or both before each game. The board always syncs both
   sides, but suggestions appear only when it is your selected color's turn.
@@ -86,11 +88,11 @@ To test the engine without screen recognition, place stones on the left board an
 
 数据按以下路径流动：
 
-`游戏窗口或截图 -> 棋盘识别 -> 合法局面确认 -> Rapfi 分析 -> 助手棋盘提示`
+`游戏窗口或截图 -> 原始棋盘识别 -> 人工修正层 -> 合法局面确认 -> Rapfi 分析 -> 助手棋盘提示`
 
 Data flows through:
 
-`game window or screenshot -> board recognition -> legal-state confirmation -> Rapfi analysis -> assistant board hint`
+`game window or screenshot -> raw board recognition -> manual correction layer -> legal-state confirmation -> Rapfi analysis -> assistant board hint`
 
 1. **采集层 / Capture**
    Qt 从你选择的 Windows 窗口读取画面，也可以加载本地截图。程序只读取像素，不向目标窗口发送鼠标或键盘操作。
@@ -98,17 +100,19 @@ Data flows through:
    Qt reads the selected Windows window or a local image. The app reads pixels only and never sends mouse or keyboard input to the target.
 
 2. **视觉层 / Vision**
-   你选择四个棋盘角点后，OpenCV 会将棋盘拉正为标准正方形，再检查 225 个交叉点，判断它们为空、黑棋或白棋。
+   你选择四个棋盘角点后，OpenCV 会将棋盘拉正为标准正方形，再检查 225 个交叉点。它结合绝对颜色、与周围棋盘的相对明暗、上一手标记、边缘半棋子和小范围中心偏移，输出空、黑、白三类证据。
 
-   After you select four board corners, OpenCV warps the board into a standard square and classifies all 225 intersections as empty, black, or white.
+   After you select four board corners, OpenCV warps the board into a standard square and evaluates all 225 intersections. It combines absolute color, relative board contrast, last-move markers, edge half-stones, and small center offsets into empty, black, and white evidence.
 
 3. **状态保护层 / State Validation**
-   动画、上一手标记或弹窗可能会干扰识别。因此程序要求连续三帧一致，并验证棋子数量、轮次和合法的多步追赶。菜单、广告或没有清晰网格的页面会暂停提示，而不是猜测局面。
+   动画、上一手标记或弹窗可能会干扰识别。因此程序融合连续三帧的逐格证据，并验证棋子数量、轮次和合法的多步追赶。只有一个低置信度格能形成唯一合法局面时才会自动修复；其他歧义会标出并等待人工修正。菜单、广告或没有清晰网格的页面会暂停提示，而不是猜测局面。
 
    Animations, last-move markers, and dialogs can confuse recognition. The app
-   requires three stable frames and checks stone counts, turn order, and legal
-   multi-move catch-up. Menus, ads, and frames without a clear grid pause
-   observation instead of guessing.
+   fuses per-cell evidence across three frames and checks stone counts, turn
+   order, and legal multi-move catch-up. It repairs one low-confidence cell
+   only when that produces the unique legal state; otherwise it marks the
+   ambiguity for manual correction. Menus, ads, and frames without a clear grid
+   pause observation instead of guessing.
 
 4. **棋力层 / Engine**
    Rapfi 在本地进程中运行，根据当前局面搜索最佳走法。随附版本稳定输出最佳一手；程序再用本地战术算法补足第二和第三候选，所以不会把它们伪装成 Rapfi 的精确评分。
@@ -116,9 +120,9 @@ Data flows through:
    Rapfi runs as a local process and searches the best move. The bundled version reliably returns one best move; the app uses a local tactical algorithm for second and third alternatives, without presenting them as exact Rapfi scores.
 
 5. **显示与记录层 / Display and Logging**
-   助手棋盘显示当前局面、可靠的棋子手数和候选，并标出最后确认的一手。关闭程序时会把逐手记录、分析参数、实际搜索时间、深度和终局结果保存到 `sessions/`，可用于复盘。
+   助手棋盘显示当前局面、可靠的棋子手数和候选，并标出最后确认的一手。人工修正会在本局持续覆盖自动识别，直到新局、重新开始观察、切换窗口、重新标定或主动清除。关闭程序时会把逐手记录、纠错事件、分析参数、实际搜索时间、深度和终局结果保存到 `sessions/`，可用于复盘。
 
-   The assistant board shows the position, reliable move numbers, the latest confirmed move, and suggestions. On close, it saves moves, analysis parameters, elapsed time, depth, and terminal results to `sessions/` for replay.
+   The assistant board shows the position, reliable move numbers, the latest confirmed move, and suggestions. Manual corrections override visual recognition for the current game until a new game, a new observation run, a target switch, recalibration, or an explicit clear. On close, it saves moves, correction events, analysis parameters, elapsed time, depth, and terminal results to `sessions/` for replay.
 
 ## 搜索时限 / Search Limits
 
@@ -182,6 +186,8 @@ If the project is copied to a computer without AVX2 support, use `Select Rapfi.e
    and capture size, then loads it automatically when that window is selected.
 5. 优先收集空棋盘、早中晚盘、上一手标记、胜负动画和不同窗口尺寸的截图。这些截图用于调节视觉阈值和补充回归测试，不用于训练新的棋力模型。
    Collect screenshots of empty, early, middle, and late boards, last-move markers, win animations, and different window sizes. They tune visual thresholds and regression tests; they do not train a new game-strength model.
+6. 如果自动棋盘少子或多子，先观察黄色虚线格；在 `Manual correction` 选择黑、白或擦除并点击该格。修正会持续到本局结束，随后按新的中央棋盘自动计算建议。
+   If the automatic board misses or adds a stone, inspect yellow dashed cells, choose black, white, or erase under `Manual correction`, and click that point. The correction persists for the game and suggestions are recalculated from the corrected assistant board.
 
 ## 开发命令 / Development Commands
 

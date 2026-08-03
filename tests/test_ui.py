@@ -9,6 +9,27 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox
 from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus
 from gomoku_assistant.domain import BoardState, Stone
 from gomoku_assistant.ui import CalibrationDialog, MainWindow
+from gomoku_assistant.vision import CellEvidence, RecognitionResult
+
+
+def _recognition(board: BoardState) -> RecognitionResult:
+    evidence = tuple(
+        CellEvidence(
+            black=1.0 if stone is Stone.BLACK else 0.0,
+            white=1.0 if stone is Stone.WHITE else 0.0,
+            empty=1.0 if stone is Stone.EMPTY else 0.0,
+        )
+        for stone in board.cells
+    )
+    return RecognitionResult(
+        board=board,
+        confidence=1.0,
+        cell_confidences=(1.0,) * len(board.cells),
+        board_visible=True,
+        grid_score=1.0,
+        warped=np.zeros((841, 841, 3), dtype=np.uint8),
+        cell_evidence=evidence,
+    )
 
 
 def test_low_contrast_calibration_allows_save() -> None:
@@ -150,4 +171,71 @@ def test_observed_move_numbers_appear_on_the_assistant_board() -> None:
     assert application is not None
     assert window._move_numbers == {(7, 7): 1}
     assert window._board_canvas._move_numbers == {(7, 7): 1}
+    window.close()
+
+
+def test_manual_correction_survives_a_repeated_missing_stone_while_observing() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    raw = BoardState.empty()
+    window._board = raw
+    window._board_canvas.set_board(raw)
+    window._last_raw_recognition = _recognition(raw)
+
+    window._on_manual_board_edit(raw.set_cell(7, 7, Stone.BLACK))
+
+    assert application is not None
+    assert window._board.at(7, 7) is Stone.BLACK
+    assert window._corrections.overrides == {(7, 7): Stone.BLACK}
+
+    raw_after_white = raw.set_cell(8, 7, Stone.WHITE)
+    corrected = window._apply_corrections(_recognition(raw_after_white))
+    for _ in range(3):
+        _, committed = window._tracker.observe(corrected)
+
+    assert committed is not None
+    assert committed.counts() == (1, 1)
+    assert committed.at(7, 7) is Stone.BLACK
+    assert committed.at(8, 7) is Stone.WHITE
+    window.close()
+
+
+def test_manual_erase_persists_and_can_be_undone() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    raw = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+    window._board = raw
+    window._board_canvas.set_board(raw)
+    window._last_raw_recognition = _recognition(raw)
+
+    window._on_manual_board_edit(raw.set_cell(7, 7, Stone.EMPTY))
+
+    assert application is not None
+    assert window._board.at(7, 7) is Stone.EMPTY
+    assert window._corrections.overrides == {(7, 7): Stone.EMPTY}
+
+    window.undo_correction()
+
+    assert window._board.at(7, 7) is Stone.BLACK
+    assert window._corrections.count == 0
+    window.close()
+
+
+def test_stable_raw_new_game_clears_persistent_manual_corrections() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    raw = BoardState.empty()
+    window._board = raw
+    window._board_canvas.set_board(raw)
+    window._last_raw_recognition = _recognition(raw)
+    window._on_manual_board_edit(raw.set_cell(7, 7, Stone.BLACK))
+
+    first = window._maybe_start_new_game_from_raw_frame(_recognition(raw))
+    second = window._maybe_start_new_game_from_raw_frame(_recognition(raw))
+
+    assert application is not None
+    assert not first
+    assert second
+    assert window._corrections.count == 0
+    assert window._board == BoardState.empty()
     window.close()

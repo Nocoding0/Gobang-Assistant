@@ -4,11 +4,24 @@ import numpy as np
 from gomoku_assistant.domain import BoardState, Stone
 from gomoku_assistant.vision import (
     BoardProfile,
+    CellEvidence,
     RecognitionResult,
     StableStateTracker,
     is_valid_board_quadrilateral,
     recognize_frame,
 )
+
+
+def _evidence_result(board: BoardState, evidence: tuple[CellEvidence, ...]) -> RecognitionResult:
+    return RecognitionResult(
+        board=board,
+        confidence=1.0,
+        cell_confidences=tuple(cell.confidence for cell in evidence),
+        board_visible=True,
+        grid_score=1.0,
+        warped=np.zeros((841, 841, 3), dtype=np.uint8),
+        cell_evidence=evidence,
+    )
 
 
 def _synthetic_board() -> tuple[np.ndarray, BoardProfile]:
@@ -314,3 +327,50 @@ def test_state_tracker_commits_multi_move_catch_up() -> None:
     assert transition.valid
     assert transition.added_count == 2
     assert caught_up == after
+
+
+def test_state_tracker_repairs_one_unique_ambiguous_missing_black() -> None:
+    board = BoardState.empty().set_cell(8, 7, Stone.WHITE)
+    evidence = [CellEvidence(black=0.0, white=0.0, empty=1.0) for _ in board.cells]
+    evidence[board.index(8, 7)] = CellEvidence(black=0.0, white=1.0, empty=0.0)
+    evidence[board.index(7, 7)] = CellEvidence(black=0.62, white=0.0, empty=0.74)
+    tracker = StableStateTracker(required_frames=1)
+
+    transition, committed = tracker.observe(_evidence_result(board, tuple(evidence)))
+
+    assert transition.valid
+    assert "repaired" in transition.reason
+    assert committed is not None
+    assert committed.counts() == (1, 1)
+    assert committed.at(7, 7) is Stone.BLACK
+
+
+def test_state_tracker_does_not_guess_between_two_ambiguous_repairs() -> None:
+    board = BoardState.empty().set_cell(8, 7, Stone.WHITE)
+    evidence = [CellEvidence(black=0.0, white=0.0, empty=1.0) for _ in board.cells]
+    evidence[board.index(8, 7)] = CellEvidence(black=0.0, white=1.0, empty=0.0)
+    evidence[board.index(6, 7)] = CellEvidence(black=0.62, white=0.0, empty=0.74)
+    evidence[board.index(7, 7)] = CellEvidence(black=0.62, white=0.0, empty=0.74)
+    tracker = StableStateTracker(required_frames=1)
+
+    transition, committed = tracker.observe(_evidence_result(board, tuple(evidence)))
+
+    assert not transition.valid
+    assert committed is None
+
+
+def test_relative_contrast_recognizes_black_below_absolute_threshold() -> None:
+    edge = 840
+    frame = np.full((edge + 1, edge + 1, 3), (145, 145, 145), dtype=np.uint8)
+    for coordinate in range(0, edge + 1, 60):
+        cv2.line(frame, (coordinate, 0), (coordinate, edge), (115, 115, 115), 2)
+        cv2.line(frame, (0, coordinate), (edge, coordinate), (115, 115, 115), 2)
+    cv2.circle(frame, (7 * 60, 7 * 60), 25, (105, 105, 105), -1)
+    profile = BoardProfile(
+        board_size=15,
+        corners=((0, 0), (edge, 0), (edge, edge), (0, edge)),
+    )
+
+    result = recognize_frame(frame, profile)
+
+    assert result.board.at(7, 7) is Stone.BLACK

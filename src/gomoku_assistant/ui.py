@@ -42,7 +42,7 @@ from .capture import (
     is_blank_frame,
     list_visible_windows,
 )
-from .domain import BoardState, Stone, infer_observed_moves
+from .domain import BoardCorrectionState, BoardState, CorrectionEvent, Stone, infer_observed_moves
 from .engine import (
     MAX_RAPFI_SEARCH_TIME_MS,
     MAX_TOTAL_ANALYSIS_TIME_MS,
@@ -53,6 +53,8 @@ from .profiles import ProfileStore
 from .sessions import SessionLogger
 from .vision import (
     BoardProfile,
+    CellEvidence,
+    RecognitionResult,
     StableStateTracker,
     is_valid_board_quadrilateral,
     order_corners,
@@ -89,9 +91,11 @@ class BoardCanvas(QWidget):
         self.setMinimumSize(520, 520)
         self._board = BoardState.empty()
         self._candidates: tuple[CandidateMove, ...] = ()
-        self._edit_mode: Stone | None = None
+        self._edit_mode: Stone | str = "off"
         self._move_numbers: dict[tuple[int, int], int] = {}
         self._last_move: tuple[int, int] | None = None
+        self._correction_points: tuple[tuple[int, int], ...] = ()
+        self._ambiguous_points: tuple[tuple[int, int], ...] = ()
 
     @property
     def board(self) -> BoardState:
@@ -105,8 +109,17 @@ class BoardCanvas(QWidget):
         self._candidates = candidates
         self.update()
 
-    def set_edit_mode(self, stone: Stone | None) -> None:
-        self._edit_mode = stone
+    def set_edit_mode(self, mode: Stone | str) -> None:
+        self._edit_mode = mode
+
+    def set_visual_annotations(
+        self,
+        correction_points: tuple[tuple[int, int], ...],
+        ambiguous_points: tuple[tuple[int, int], ...],
+    ) -> None:
+        self._correction_points = correction_points
+        self._ambiguous_points = ambiguous_points
+        self.update()
 
     def set_move_annotations(
         self, move_numbers: dict[tuple[int, int], int], last_move: tuple[int, int] | None
@@ -143,10 +156,12 @@ class BoardCanvas(QWidget):
         if point is None:
             return
         x, y = point
+        if self._edit_mode == "off":
+            return
         current = self._board.at(x, y)
         if self._edit_mode is Stone.EMPTY:
             next_board = self._board.set_cell(x, y, Stone.EMPTY)
-        elif self._edit_mode is not None:
+        elif isinstance(self._edit_mode, Stone):
             next_board = self._board.set_cell(x, y, self._edit_mode)
         elif current is Stone.EMPTY:
             try:
@@ -194,6 +209,31 @@ class BoardCanvas(QWidget):
                     painter.setBrush(QColor("#fbfbf8"))
                     painter.setPen(QPen(QColor("#a8a8a0"), 1.2))
                 painter.drawEllipse(center, stone_radius, stone_radius)
+
+        for x, y in self._ambiguous_points:
+            if not self._board.in_bounds(x, y):
+                continue
+            center = self._point_to_screen(x, y)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(
+                QPen(QColor("#c88810"), max(1.5, spacing * 0.045), Qt.PenStyle.DashLine)
+            )
+            painter.drawRect(
+                QRectF(
+                    center.x() - stone_radius * 0.82,
+                    center.y() - stone_radius * 0.82,
+                    stone_radius * 1.64,
+                    stone_radius * 1.64,
+                )
+            )
+
+        for x, y in self._correction_points:
+            if not self._board.in_bounds(x, y):
+                continue
+            center = self._point_to_screen(x, y)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#167e79"), max(2.0, spacing * 0.06)))
+            painter.drawEllipse(center, stone_radius * 0.93, stone_radius * 0.93)
 
         if self._last_move is not None and self._board.in_bounds(*self._last_move):
             center = self._point_to_screen(*self._last_move)
@@ -413,6 +453,9 @@ class MainWindow(QMainWindow):
         self._candidates: tuple[CandidateMove, ...] = ()
         self._move_numbers: dict[tuple[int, int], int] = {}
         self._last_move: tuple[int, int] | None = None
+        self._corrections = BoardCorrectionState()
+        self._last_raw_recognition: RecognitionResult | None = None
+        self._raw_reset_samples: list[BoardState] = []
         self._profile_store = ProfileStore(Path.cwd() / "profiles")
         self._profile: BoardProfile | None = None
         self._last_frame: np.ndarray | None = None
@@ -479,11 +522,16 @@ class MainWindow(QMainWindow):
         self._rapfi_threads.valueChanged.connect(self._save_engine_settings)
         self._rapfi_hash.currentIndexChanged.connect(self._save_engine_settings)
         self._edit_mode = QComboBox()
-        self._edit_mode.addItem("Auto move", None)
+        self._edit_mode.addItem("Off", "off")
+        self._edit_mode.addItem("Auto move", "auto")
         self._edit_mode.addItem("Place black", Stone.BLACK)
         self._edit_mode.addItem("Place white", Stone.WHITE)
         self._edit_mode.addItem("Erase", Stone.EMPTY)
         self._edit_mode.currentIndexChanged.connect(self._update_edit_mode)
+        self._undo_correction_button = QPushButton("Undo correction")
+        self._undo_correction_button.clicked.connect(self.undo_correction)
+        self._clear_corrections_button = QPushButton("Clear corrections")
+        self._clear_corrections_button.clicked.connect(self.clear_corrections)
         self._my_color = QComboBox()
         self._my_color.addItem("Choose my color", None)
         self._my_color.addItem("Black", Stone.BLACK)
@@ -513,7 +561,9 @@ class MainWindow(QMainWindow):
         controls.addRow("Profile", self._profile_status)
         controls.addRow("Sync status", self._status)
         controls.addRow("", self._observe_button)
-        controls.addRow("Edit board", self._edit_mode)
+        controls.addRow("Manual correction", self._edit_mode)
+        controls.addRow("", self._undo_correction_button)
+        controls.addRow("", self._clear_corrections_button)
         controls.addRow("My color", self._my_color)
         controls.addRow("Black search", self._black_search_time)
         controls.addRow("White search", self._white_search_time)
@@ -552,6 +602,7 @@ class MainWindow(QMainWindow):
         self._refresh_shortcut.activated.connect(self.refresh_windows)
         self.refresh_windows()
         self._update_edit_mode()
+        self._refresh_visual_annotations()
 
     def _default_rapfi_path(self) -> Path | None:
         candidate = Path.cwd() / "vendor" / "rapfi" / "Rapfi.exe"
@@ -620,6 +671,126 @@ class MainWindow(QMainWindow):
         self._board_canvas.set_move_annotations(self._move_numbers, self._last_move)
         self._session.record_moves(moves, source=source)
 
+    def _raw_board(self) -> BoardState:
+        return self._last_raw_recognition.board if self._last_raw_recognition else self._board
+
+    def _apply_corrections(self, recognition: RecognitionResult) -> RecognitionResult:
+        if self._corrections.count == 0:
+            return recognition
+        board = self._corrections.apply(recognition.board)
+        confidences = list(recognition.cell_confidences)
+        evidence = list(recognition.cell_evidence)
+        for (x, y), stone in self._corrections.overrides.items():
+            index = board.index(x, y)
+            if len(confidences) == len(board.cells):
+                confidences[index] = 1.0
+            if len(evidence) == len(board.cells):
+                evidence[index] = CellEvidence(
+                    black=1.0 if stone is Stone.BLACK else 0.0,
+                    white=1.0 if stone is Stone.WHITE else 0.0,
+                    empty=1.0 if stone is Stone.EMPTY else 0.0,
+                )
+        correction_points = set(self._corrections.points)
+        return replace(
+            recognition,
+            board=board,
+            confidence=float(np.mean(confidences)) if confidences else recognition.confidence,
+            cell_confidences=tuple(confidences),
+            cell_evidence=tuple(evidence),
+            ambiguous_points=tuple(
+                point for point in recognition.ambiguous_points if point not in correction_points
+            ),
+        )
+
+    def _refresh_visual_annotations(self, recognition: RecognitionResult | None = None) -> None:
+        current = recognition or self._last_raw_recognition
+        ambiguous = current.ambiguous_points if current is not None else ()
+        correction_points = set(self._corrections.points)
+        self._board_canvas.set_visual_annotations(
+            self._corrections.points,
+            tuple(point for point in ambiguous if point not in correction_points),
+        )
+        self._undo_correction_button.setEnabled(self._corrections.can_undo)
+        self._clear_corrections_button.setEnabled(self._corrections.count > 0)
+
+    def _record_correction(self, event: CorrectionEvent) -> None:
+        self._session.record_correction(event)
+
+    def _record_manual_change(self, previous: BoardState, current: BoardState) -> None:
+        moves = infer_observed_moves(previous, current)
+        if moves:
+            self._record_observed_moves(previous, current, source="manual_correction")
+            return
+        changed = [
+            (x, y)
+            for y in range(current.size)
+            for x in range(current.size)
+            if previous.at(x, y) is not current.at(x, y)
+        ]
+        for point in changed:
+            self._move_numbers.pop(point, None)
+        if self._last_move in changed:
+            numbered = [
+                (number, point) for point, number in self._move_numbers.items() if current.at(*point) is not Stone.EMPTY
+            ]
+            self._last_move = max(numbered)[1] if numbered else None
+        self._board_canvas.set_move_annotations(self._move_numbers, self._last_move)
+
+    def _set_corrected_board(self, board: BoardState, status: str) -> None:
+        self._tracker.rebase(board)
+        self._set_board(board, analyze=False)
+        self._refresh_visual_annotations()
+        if board.is_terminal():
+            self._session.finish_game(board)
+            self._status.setText(status)
+            return
+        if not board.is_count_legal():
+            self._candidate_text.setText("Manual correction is incomplete: fix black/white counts before analysis.")
+            self._status.setText(status)
+            return
+        self._status.setText(status)
+        if self._should_analyze_turn(board):
+            self.analyze_current_board()
+        else:
+            next_side = "Black" if board.side_to_move() is Stone.BLACK else "White"
+            self._candidate_text.setText(f"Manual correction saved. Waiting for {next_side}.")
+
+    def _clear_correction_state(self, *, record: bool) -> tuple[CorrectionEvent, ...]:
+        events = self._corrections.clear()
+        if record:
+            for event in events:
+                self._record_correction(event)
+        self._refresh_visual_annotations()
+        return events
+
+    def _maybe_start_new_game_from_raw_frame(self, recognition: RecognitionResult) -> bool:
+        if self._corrections.count == 0:
+            self._raw_reset_samples.clear()
+            return False
+        raw = recognition.board
+        if (
+            recognition.obstruction_reason is not None
+            or not recognition.board_visible
+            or recognition.confidence < self._tracker.min_confidence
+            or not raw.is_count_legal()
+            or sum(raw.counts()) >= sum(self._board.counts())
+        ):
+            self._raw_reset_samples.clear()
+            return False
+        self._raw_reset_samples.append(raw)
+        self._raw_reset_samples = self._raw_reset_samples[-self._tracker.reset_frames :]
+        if len(self._raw_reset_samples) != self._tracker.reset_frames or len(
+            set(sample.cells for sample in self._raw_reset_samples)
+        ) != 1:
+            return False
+        self._clear_correction_state(record=False)
+        self._tracker.reset()
+        self._reset_move_history(start_new_game=True)
+        self._set_board(BoardState.empty(), analyze=False)
+        self._raw_reset_samples.clear()
+        self._status.setText("New game detected. Cleared previous manual corrections.")
+        return True
+
     def _save_profile(self) -> None:
         if self._profile is None:
             return
@@ -673,6 +844,9 @@ class MainWindow(QMainWindow):
         self._capture_session.stop()
         self._last_frame = None
         self._last_window = None
+        self._last_raw_recognition = None
+        self._raw_reset_samples.clear()
+        self._clear_correction_state(record=False)
         self._tracker.reset()
         self._reset_move_history()
         self._set_board(BoardState.empty(), analyze=False)
@@ -784,6 +958,7 @@ class MainWindow(QMainWindow):
             window_title=self._last_window.title if self._last_window else None,
         )
         self._tracker.reset()
+        self._clear_correction_state(record=False)
         self._invalidate_analysis()
         self._save_profile()
         self._profile_status.setText(self._profile_status_text())
@@ -830,6 +1005,9 @@ class MainWindow(QMainWindow):
                 )
                 return
         if enabled:
+            self._clear_correction_state(record=False)
+            self._last_raw_recognition = None
+            self._raw_reset_samples.clear()
             self._tracker.reset()
             self._set_board(BoardState.empty(), analyze=False)
             self._reset_move_history(start_new_game=True)
@@ -898,7 +1076,11 @@ class MainWindow(QMainWindow):
         if frame is None:
             return
         try:
-            recognition = recognize_frame(frame, self._profile)
+            raw_recognition = recognize_frame(frame, self._profile)
+            self._last_raw_recognition = raw_recognition
+            self._maybe_start_new_game_from_raw_frame(raw_recognition)
+            recognition = self._apply_corrections(raw_recognition)
+            self._refresh_visual_annotations(raw_recognition)
             transition, committed = self._tracker.observe(recognition)
         except Exception as error:
             self._status.setText(f"Recognition paused: {error}")
@@ -906,6 +1088,7 @@ class MainWindow(QMainWindow):
         if committed is not None:
             previous = self._board
             if transition.reason == "new game detected":
+                self._clear_correction_state(record=False)
                 self._reset_move_history(start_new_game=True)
                 previous = BoardState.empty()
             self._record_observed_moves(previous, committed, source="vision")
@@ -941,18 +1124,27 @@ class MainWindow(QMainWindow):
                     f"Last confirmed board: B{black}/W{white}. Waiting for the popup to clear."
                 )
             else:
-                black, white = recognition.board.counts()
+                black, white = raw_recognition.board.counts()
                 confirmed_black, confirmed_white = self._board.counts()
+                ambiguous = ", ".join(
+                    self._board.coordinate_name(x, y)
+                    for x, y in raw_recognition.ambiguous_points[:4]
+                )
+                ambiguity_text = f"; check {ambiguous}" if ambiguous else ""
                 self._status.setText(
                     f"Not synced: {transition.reason}; grid {recognition.grid_score:.0%}; "
                     f"confidence {recognition.confidence:.0%}; detected B{black}/W{white}; "
-                    f"last confirmed B{confirmed_black}/W{confirmed_white}."
+                    f"last confirmed B{confirmed_black}/W{confirmed_white}{ambiguity_text}."
                 )
         else:
-            black, white = recognition.board.counts()
+            black, white = raw_recognition.board.counts()
+            ambiguous = ", ".join(
+                self._board.coordinate_name(x, y) for x, y in raw_recognition.ambiguous_points[:4]
+            )
+            ambiguity_text = f"; check {ambiguous}" if ambiguous else ""
             self._status.setText(
                 f"Watching: grid {recognition.grid_score:.0%}; confidence "
-                f"{recognition.confidence:.0%}; detected B{black}/W{white}; {transition.reason}."
+                f"{recognition.confidence:.0%}; detected B{black}/W{white}; {transition.reason}{ambiguity_text}."
             )
 
     def _should_analyze_turn(self, board: BoardState) -> bool:
@@ -976,15 +1168,53 @@ class MainWindow(QMainWindow):
 
     def _on_manual_board_edit(self, board: BoardState) -> None:
         previous = self._board
-        moves = infer_observed_moves(previous, board)
-        if moves:
-            self._record_observed_moves(previous, board, source="manual")
-        elif board != previous:
-            self._reset_move_history()
-        self._set_board(board, analyze=False)
-        if board.is_terminal():
-            self._session.finish_game(board)
-        self._status.setText("Manual board edited. Select Analyze position when ready.")
+        changed = [
+            (x, y)
+            for y in range(board.size)
+            for x in range(board.size)
+            if previous.at(x, y) is not board.at(x, y)
+        ]
+        if len(changed) != 1:
+            return
+        x, y = changed[0]
+        event = self._corrections.set_cell(self._raw_board(), x, y, board.at(x, y))
+        if event is None:
+            self._board_canvas.set_board(previous)
+            return
+        corrected = self._corrections.apply(self._raw_board())
+        self._record_correction(event)
+        self._record_manual_change(previous, corrected)
+        self._set_corrected_board(
+            corrected,
+            f"Manual correction: {corrected.coordinate_name(x, y)} {event.action}. "
+            f"{self._corrections.count} correction(s) active.",
+        )
+
+    def undo_correction(self) -> None:
+        event = self._corrections.undo(self._raw_board())
+        if event is None:
+            self._status.setText("No manual correction to undo.")
+            return
+        previous = self._board
+        corrected = self._corrections.apply(self._raw_board())
+        self._record_correction(event)
+        self._record_manual_change(previous, corrected)
+        self._set_corrected_board(
+            corrected,
+            f"Undid correction at {corrected.coordinate_name(event.x, event.y)}. "
+            f"{self._corrections.count} correction(s) active.",
+        )
+
+    def clear_corrections(self) -> None:
+        events = self._clear_correction_state(record=True)
+        if not events:
+            self._status.setText("No manual corrections are active.")
+            return
+        self._tracker.reset()
+        self._raw_reset_samples.clear()
+        self._invalidate_analysis()
+        self._candidate_text.setText("Corrections cleared. Waiting for a stable visual board.")
+        self._status.setText("Corrections cleared. Resynchronizing from stable visual frames.")
 
     def _set_board(self, board: BoardState, analyze: bool) -> None:
         self._invalidate_analysis()

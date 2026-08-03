@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis import AnalysisResult
-from .domain import BoardState, ObservedMove, Stone
+from .domain import BoardState, CorrectionEvent, ObservedMove, Stone
 
 
 def _utc_now() -> str:
@@ -39,6 +39,18 @@ class MoveEntry:
 
 
 @dataclass(frozen=True)
+class CorrectionEntry:
+    at_utc: str
+    game_id: int
+    x: int
+    y: int
+    before: str
+    after: str
+    vision: str
+    action: str
+
+
+@dataclass(frozen=True)
 class GameResult:
     at_utc: str
     game_id: int
@@ -55,6 +67,7 @@ class SessionLogger:
         self.directory = directory
         self.entries: list[SessionEntry] = []
         self.moves: list[MoveEntry] = []
+        self.corrections: list[CorrectionEntry] = []
         self.results: list[GameResult] = []
         self.games: list[dict[str, object]] = []
         self._current_game_id = 0
@@ -91,6 +104,20 @@ class SessionLogger:
                 source=source,
             )
             for move in moves
+        )
+
+    def record_correction(self, event: CorrectionEvent) -> None:
+        self.corrections.append(
+            CorrectionEntry(
+                at_utc=_utc_now(),
+                game_id=self._ensure_game(),
+                x=event.x,
+                y=event.y,
+                before=event.before.name.lower(),
+                after=event.after.name.lower(),
+                vision=event.vision.name.lower(),
+                action=event.action,
+            )
         )
 
     def append(self, result: AnalysisResult) -> None:
@@ -147,7 +174,7 @@ class SessionLogger:
         )
 
     def save(self) -> Path | None:
-        if not (self.entries or self.moves or self.results):
+        if not (self.entries or self.moves or self.corrections or self.results):
             return None
         self.directory.mkdir(parents=True, exist_ok=True)
         filename = datetime.now().strftime("%Y%m%d-%H%M%S") + ".json"
@@ -155,9 +182,10 @@ class SessionLogger:
         target.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "games": self.games,
                     "moves": [asdict(move) for move in self.moves],
+                    "corrections": [asdict(correction) for correction in self.corrections],
                     "analyses": [asdict(entry) for entry in self.entries],
                     "results": [asdict(result) for result in self.results],
                 },

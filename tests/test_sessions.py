@@ -1,7 +1,7 @@
 import json
 
 from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus, SearchStats
-from gomoku_assistant.domain import BoardState, Stone
+from gomoku_assistant.domain import BoardState, CorrectionEvent, Stone
 from gomoku_assistant.sessions import SessionLogger
 
 
@@ -41,5 +41,27 @@ def test_session_records_the_board_analyzed_by_the_engine(tmp_path) -> None:
 
     assert target is not None
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["analyses"][0]["search"]["requested_time_ms"] == 15_000
+
+
+def test_session_records_manual_correction_events(tmp_path) -> None:
+    logger = SessionLogger(tmp_path)
+
+    logger.record_correction(
+        CorrectionEvent(
+            x=7,
+            y=7,
+            before=Stone.EMPTY,
+            after=Stone.BLACK,
+            vision=Stone.EMPTY,
+            action="add",
+        )
+    )
+
+    target = logger.save()
+
+    assert target is not None
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["corrections"][0]["action"] == "add"
+    assert payload["corrections"][0]["after"] == "black"
