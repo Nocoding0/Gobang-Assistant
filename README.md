@@ -57,6 +57,16 @@ After the application opens, follow these steps:
 
 To test the engine without screen recognition, place stones on the left board and click `Analyze position`.
 
+### 手动搬运对局 / Manual Relay
+
+当目标窗口不适合图像识别时，切换右侧的 `手动搬运` 标签，选择自己的棋色，然后点击 `新建手动对局`。对方每落一子，就在助手左侧棋盘点击相同交叉点；轮到你时，助手会分析并自动在自己的棋盘采用第 `1` 推荐点，蓝色圆圈标出需要你在真实棋盘落下的位置。
+
+When the target cannot be recognized reliably, open the `手动搬运` tab, choose your color, and select `新建手动对局`. Copy each opponent move to the assistant board. On your turn the assistant analyzes the position and automatically adopts recommendation `1`; a blue ring marks the point to place on the real board.
+
+在录入下一颗对方棋子前，`改走本手` 会撤回自动采用的落点，让你选择其他推荐点或任意实际落点。`撤销上一手` 可以恢复刚才的录入；`编辑局面` 可用于从中盘开始重建黑白棋，完成后只有后续可靠录入的棋子才显示手数。
+
+Before entering the next opponent move, `改走本手` removes the auto-selected point so you can choose another recommendation or any actual move. `撤销上一手` rolls back the latest entry. `编辑局面` rebuilds a mid-game position; only moves entered reliably after setup receive move numbers.
+
 ## 界面说明 / Interface Guide
 
 - `Refresh windows`: 重新扫描可以读取的 Windows 窗口。  
@@ -88,11 +98,15 @@ To test the engine without screen recognition, place stones on the left board an
 
 数据按以下路径流动：
 
-`游戏窗口或截图 -> 原始棋盘识别 -> 人工修正层 -> 合法局面确认 -> Rapfi 分析 -> 助手棋盘提示`
+`自动识别：游戏窗口或截图 -> 原始棋盘识别 -> 人工修正层 -> 合法局面确认 -> Rapfi 分析 -> 助手棋盘提示`
+
+`手动搬运：对方落子录入 -> Rapfi 分析 -> 自动采用首选 -> 真实棋盘落子 -> 下一颗对方棋子`
 
 Data flows through:
 
-`game window or screenshot -> raw board recognition -> manual correction layer -> legal-state confirmation -> Rapfi analysis -> assistant board hint`
+`vision: game window or screenshot -> raw board recognition -> manual correction layer -> legal-state confirmation -> Rapfi analysis -> assistant board hint`
+
+`manual relay: enter opponent move -> Rapfi analysis -> auto-adopt first choice -> play on real board -> enter next opponent move`
 
 1. **采集层 / Capture**
    Qt 从你选择的 Windows 窗口读取画面，也可以加载本地截图。程序只读取像素，不向目标窗口发送鼠标或键盘操作。

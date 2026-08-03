@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
 from gomoku_assistant.analysis import AnalysisResult, CandidateMove, ProofStatus, RecommendationMode
 from gomoku_assistant.domain import BoardState, Stone
-from gomoku_assistant.ui import CalibrationDialog, MainWindow
+from gomoku_assistant.ui import CalibrationDialog, InputMode, MainWindow
 from gomoku_assistant.vision import CellEvidence, RecognitionResult
 
 
@@ -264,4 +264,53 @@ def test_stable_raw_new_game_clears_persistent_manual_corrections() -> None:
     assert second
     assert window._corrections.count == 0
     assert window._board == BoardState.empty()
+    window.close()
+
+
+def test_manual_relay_auto_adopts_first_recommendation_and_allows_change() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._input_mode = InputMode.MANUAL_RELAY
+    window._my_color.setCurrentIndex(1)
+    window._update_edit_mode()
+    board = BoardState.empty()
+    first = CandidateMove(7, 7, 1, 100, ProofStatus.HEURISTIC)
+    second = CandidateMove(8, 7, 2, 90, ProofStatus.HEURISTIC)
+    window._board = board
+    window._board_canvas.set_board(board)
+    window._analysis_version = 1
+
+    window._on_analysis_ready(
+        1,
+        AnalysisResult(board=board, candidates=(first, second), engine_name="Rapfi"),
+    )
+
+    assert application is not None
+    assert window._board.at(7, 7) is Stone.BLACK
+    assert window._manual.pending
+    assert window._board_canvas._pending_point == (7, 7)
+
+    window.change_manual_move()
+    window._on_manual_relay_point(8, 7)
+
+    assert window._board.at(7, 7) is Stone.EMPTY
+    assert window._board.at(8, 7) is Stone.BLACK
+    assert window._manual.pending
+    window.close()
+
+
+def test_manual_setup_edits_authoritative_board_without_vision_overrides() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._input_mode = InputMode.MANUAL_RELAY
+    window._manual.setup = True
+    window._manual_setup_tool.setCurrentIndex(0)
+    window._update_edit_mode()
+    edited = BoardState.empty().set_cell(7, 7, Stone.BLACK)
+
+    window._on_manual_board_edit(edited)
+
+    assert application is not None
+    assert window._board == edited
+    assert window._corrections.count == 0
     window.close()

@@ -80,13 +80,14 @@ class SessionLogger:
     def current_game_id(self) -> int:
         return self._current_game_id
 
-    def start_game(self, my_color: Stone | None = None) -> int:
+    def start_game(self, my_color: Stone | None = None, input_mode: str = "vision") -> int:
         self._current_game_id += 1
         self.games.append(
             {
                 "id": self._current_game_id,
                 "started_at_utc": _utc_now(),
                 "my_color": my_color.name.lower() if my_color is not None else None,
+                "input_mode": input_mode,
             }
         )
         return self._current_game_id
@@ -123,6 +124,16 @@ class SessionLogger:
                 action=event.action,
             )
         )
+
+    def remove_last_move(self, source_prefix: str = "manual_relay") -> bool:
+        """Remove a provisional manual move before the session is persisted."""
+
+        for index in range(len(self.moves) - 1, -1, -1):
+            move = self.moves[index]
+            if move.game_id == self._current_game_id and move.source.startswith(source_prefix):
+                del self.moves[index]
+                return True
+        return False
 
     def append(self, result: AnalysisResult) -> None:
         stats = result.search_stats
@@ -199,7 +210,7 @@ class SessionLogger:
         target.write_text(
             json.dumps(
                 {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "games": self.games,
                     "moves": [asdict(move) for move in self.moves],
                     "corrections": [asdict(correction) for correction in self.corrections],

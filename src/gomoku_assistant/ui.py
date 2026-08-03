@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -71,6 +74,19 @@ from .vision import (
 MARKER_COLORS = (QColor("#c73b33"), QColor("#c88810"), QColor("#167e79"))
 
 
+class InputMode(str, Enum):
+    VISION = "vision"
+    MANUAL_RELAY = "manual-relay"
+
+
+@dataclass
+class ManualRelayState:
+    pending: bool = False
+    changing_move: bool = False
+    setup: bool = False
+    pending_before: BoardState | None = None
+
+
 def _pixmap_to_bgr(pixmap: QPixmap) -> np.ndarray:
     image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
     array = np.frombuffer(image.bits(), dtype=np.uint8).reshape(image.height(), image.width(), 4)
@@ -91,6 +107,7 @@ def _bgr_to_pixmap(frame: np.ndarray) -> QPixmap:
 
 class BoardCanvas(QWidget):
     board_edited = Signal(object)
+    relay_point_clicked = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -103,6 +120,7 @@ class BoardCanvas(QWidget):
         self._correction_points: tuple[tuple[int, int], ...] = ()
         self._ambiguous_points: tuple[tuple[int, int], ...] = ()
         self._danger_points: tuple[tuple[int, int], ...] = ()
+        self._pending_point: tuple[int, int] | None = None
 
     @property
     def board(self) -> BoardState:
@@ -118,6 +136,10 @@ class BoardCanvas(QWidget):
 
     def set_danger_points(self, points: tuple[tuple[int, int], ...]) -> None:
         self._danger_points = points
+        self.update()
+
+    def set_pending_point(self, point: tuple[int, int] | None) -> None:
+        self._pending_point = point
         self.update()
 
     def set_edit_mode(self, mode: Stone | str) -> None:
@@ -167,6 +189,9 @@ class BoardCanvas(QWidget):
         if point is None:
             return
         x, y = point
+        if self._edit_mode == "relay":
+            self.relay_point_clicked.emit(x, y)
+            return
         if self._edit_mode == "off":
             return
         current = self._board.at(x, y)
@@ -255,6 +280,12 @@ class BoardCanvas(QWidget):
                 QPointF(center.x() - stone_radius * 0.55, center.y() - stone_radius * 0.55),
                 QPointF(center.x() + stone_radius * 0.55, center.y() + stone_radius * 0.55),
             )
+
+        if self._pending_point is not None and self._board.in_bounds(*self._pending_point):
+            center = self._point_to_screen(*self._pending_point)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#1a6f9f"), max(2.0, spacing * 0.07)))
+            painter.drawEllipse(center, stone_radius * 0.9, stone_radius * 0.9)
             painter.drawLine(
                 QPointF(center.x() + stone_radius * 0.55, center.y() - stone_radius * 0.55),
                 QPointF(center.x() - stone_radius * 0.55, center.y() + stone_radius * 0.55),
@@ -492,6 +523,9 @@ class MainWindow(QMainWindow):
         self._pending_analyses = 0
         self._warmup_version = 0
         self._observation_waiting_for_engine = False
+        self._input_mode = InputMode.VISION
+        self._manual = ManualRelayState()
+        self._manual_history: list[BoardState] = []
         self._session = SessionLogger(Path.cwd() / "sessions")
         self._settings = QSettings("Nocoding0", "GomokuTrainingAssistant")
         self._rapfi_path = self._default_rapfi_path()
@@ -499,6 +533,7 @@ class MainWindow(QMainWindow):
 
         self._board_canvas = BoardCanvas()
         self._board_canvas.board_edited.connect(self._on_manual_board_edit)
+        self._board_canvas.relay_point_clicked.connect(self._on_manual_relay_point)
         self._preview = QLabel("No frame captured")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumSize(330, 230)
@@ -553,6 +588,11 @@ class MainWindow(QMainWindow):
         self._edit_mode.addItem("Place white", Stone.WHITE)
         self._edit_mode.addItem("Erase", Stone.EMPTY)
         self._edit_mode.currentIndexChanged.connect(self._update_edit_mode)
+        self._manual_setup_tool = QComboBox()
+        self._manual_setup_tool.addItem("放置黑棋", Stone.BLACK)
+        self._manual_setup_tool.addItem("放置白棋", Stone.WHITE)
+        self._manual_setup_tool.addItem("擦除", Stone.EMPTY)
+        self._manual_setup_tool.currentIndexChanged.connect(self._update_edit_mode)
         self._undo_correction_button = QPushButton("Undo correction")
         self._undo_correction_button.clicked.connect(self.undo_correction)
         self._clear_corrections_button = QPushButton("Clear corrections")
@@ -563,6 +603,19 @@ class MainWindow(QMainWindow):
         self._my_color.addItem("White", Stone.WHITE)
         self._my_color.addItem("Analyze both colors", "both")
         self._my_color.currentIndexChanged.connect(self._on_my_color_changed)
+        self._manual_start_button = QPushButton("新建手动对局")
+        self._manual_start_button.clicked.connect(self.start_manual_game)
+        self._manual_continue_button = QPushButton("从当前局面继续")
+        self._manual_continue_button.clicked.connect(self.continue_manual_game)
+        self._manual_undo_button = QPushButton("撤销上一手")
+        self._manual_undo_button.clicked.connect(self.undo_manual_move)
+        self._manual_change_button = QPushButton("改走本手")
+        self._manual_change_button.clicked.connect(self.change_manual_move)
+        self._manual_setup_button = QPushButton("编辑局面")
+        self._manual_setup_button.setCheckable(True)
+        self._manual_setup_button.toggled.connect(self._toggle_manual_setup)
+        self._manual_finish_setup_button = QPushButton("完成局面编辑")
+        self._manual_finish_setup_button.clicked.connect(self.finish_manual_setup)
 
         self._profile_status = QLabel(self._profile_status_text())
         self._engine_status = QLabel(self._engine_status_text())
@@ -576,40 +629,73 @@ class MainWindow(QMainWindow):
         self._candidate_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._candidate_text.setWordWrap(True)
 
-        control_group = QGroupBox("Capture and analysis")
+        control_group = QGroupBox("自动识别")
         controls = QFormLayout(control_group)
-        controls.addRow("Target window", self._window_combo)
+        controls.addRow("目标窗口", self._window_combo)
         controls.addRow("", self._refresh_windows_button)
         controls.addRow("", self._capture_button)
         controls.addRow("", self._load_image_button)
         controls.addRow("", self._calibrate_button)
-        controls.addRow("Profile", self._profile_status)
-        controls.addRow("Sync status", self._status)
+        controls.addRow("标定状态", self._profile_status)
         controls.addRow("", self._observe_button)
-        controls.addRow("Manual correction", self._edit_mode)
+        controls.addRow("识别修正", self._edit_mode)
         controls.addRow("", self._undo_correction_button)
         controls.addRow("", self._clear_corrections_button)
-        controls.addRow("My color", self._my_color)
-        controls.addRow("Black search", self._black_search_time)
-        controls.addRow("White search", self._white_search_time)
-        controls.addRow("Rapfi threads", self._rapfi_threads)
-        controls.addRow("Rapfi hash", self._rapfi_hash)
-        controls.addRow("", self._engine_button)
-        controls.addRow("Engine", self._engine_status)
+        controls.addRow("我的棋色", self._my_color)
         controls.addRow("", self._analyze_button)
         controls.addRow("", self._clear_button)
 
-        suggestion_group = QGroupBox("Suggestions")
+        manual_group = QGroupBox("手动搬运")
+        manual_layout = QVBoxLayout(manual_group)
+        manual_layout.addWidget(QLabel("把真实棋盘的对方落子点到左侧棋盘。助手会自动采用第 1 推荐。"))
+        manual_layout.addWidget(self._manual_start_button)
+        manual_layout.addWidget(self._manual_continue_button)
+        manual_layout.addWidget(self._manual_undo_button)
+        manual_layout.addWidget(self._manual_change_button)
+        manual_layout.addWidget(self._manual_setup_button)
+        manual_layout.addWidget(self._manual_setup_tool)
+        manual_layout.addWidget(self._manual_finish_setup_button)
+        manual_layout.addStretch(1)
+
+        advanced = QGroupBox("高级引擎设置")
+        advanced.setCheckable(True)
+        advanced.setChecked(False)
+        advanced_layout = QFormLayout(advanced)
+        advanced_layout.addRow("黑棋思考", self._black_search_time)
+        advanced_layout.addRow("白棋思考", self._white_search_time)
+        advanced_layout.addRow("Rapfi 线程", self._rapfi_threads)
+        advanced_layout.addRow("Rapfi 哈希", self._rapfi_hash)
+        advanced_layout.addRow("", self._engine_button)
+        advanced_layout.addRow("引擎", self._engine_status)
+        advanced.toggled.connect(lambda checked: [child.setVisible(checked) for child in advanced.findChildren(QWidget) if child is not advanced])
+        for child in advanced.findChildren(QWidget):
+            child.setVisible(False)
+
+        suggestion_group = QGroupBox("推荐落点")
         suggestion_layout = QVBoxLayout(suggestion_group)
         suggestion_layout.addWidget(self._candidate_text)
         suggestion_layout.addStretch(1)
 
+        tabs = QTabWidget()
+        vision_tab = QWidget()
+        vision_layout = QVBoxLayout(vision_tab)
+        vision_layout.addWidget(control_group)
+        vision_layout.addWidget(QLabel("最新来源画面"))
+        vision_layout.addWidget(self._preview, 1)
+        manual_tab = QWidget()
+        manual_tab_layout = QVBoxLayout(manual_tab)
+        manual_tab_layout.addWidget(manual_group)
+        tabs.addTab(vision_tab, "自动识别")
+        tabs.addTab(manual_tab, "手动搬运")
+        tabs.currentChanged.connect(self._on_input_mode_changed)
+        self._mode_tabs = tabs
+
         right_column = QWidget()
         right_layout = QVBoxLayout(right_column)
-        right_layout.addWidget(control_group)
         right_layout.addWidget(suggestion_group)
-        right_layout.addWidget(QLabel("Latest source frame"))
-        right_layout.addWidget(self._preview, 1)
+        right_layout.addWidget(self._status)
+        right_layout.addWidget(tabs, 1)
+        right_layout.addWidget(advanced)
 
         splitter = QSplitter()
         splitter.addWidget(self._board_canvas)
@@ -627,6 +713,7 @@ class MainWindow(QMainWindow):
         self._refresh_shortcut.activated.connect(self.refresh_windows)
         self.refresh_windows()
         self._update_edit_mode()
+        self._refresh_manual_controls()
         self._refresh_visual_annotations()
 
     def _default_rapfi_path(self) -> Path | None:
@@ -1178,6 +1265,11 @@ class MainWindow(QMainWindow):
 
     def _on_my_color_changed(self, _: int) -> None:
         self._invalidate_analysis()
+        if self._input_mode is InputMode.MANUAL_RELAY:
+            self._manual.pending = False
+            self._board_canvas.set_pending_point(None)
+            self._manual_maybe_analyze()
+            return
         if not self._observe_button.isChecked():
             return
         self._tracker.reset()
@@ -1188,10 +1280,178 @@ class MainWindow(QMainWindow):
         self._status.setText(f"Color changed to {selected}. Resynchronizing current board.")
 
     def _update_edit_mode(self) -> None:
-        value = self._edit_mode.currentData()
+        if self._input_mode is InputMode.MANUAL_RELAY:
+            value = self._manual_setup_tool.currentData() if self._manual.setup else "relay"
+        else:
+            value = self._edit_mode.currentData()
         self._board_canvas.set_edit_mode(value)
 
+    def _on_input_mode_changed(self, index: int) -> None:
+        mode = InputMode.VISION if index == 0 else InputMode.MANUAL_RELAY
+        if mode is self._input_mode:
+            return
+        if self._observe_button.isChecked():
+            self._observe_button.setChecked(False)
+        self._input_mode = mode
+        self._manual.pending = False
+        self._manual.changing_move = False
+        self._board_canvas.set_pending_point(None)
+        self._update_edit_mode()
+        self._refresh_manual_controls()
+        self._status.setText("已切换到手动搬运。" if mode is InputMode.MANUAL_RELAY else "已切换到自动识别。")
+
+    def _refresh_manual_controls(self) -> None:
+        active = self._input_mode is InputMode.MANUAL_RELAY
+        self._manual_start_button.setEnabled(active)
+        self._manual_continue_button.setEnabled(active and self._board.is_count_legal())
+        self._manual_undo_button.setEnabled(active and bool(self._manual_history))
+        self._manual_change_button.setEnabled(active and self._manual.pending)
+        self._manual_setup_tool.setVisible(self._manual.setup)
+        self._manual_finish_setup_button.setVisible(self._manual.setup)
+
+    def start_manual_game(self) -> None:
+        color = self._my_color.currentData()
+        if not isinstance(color, Stone):
+            self._status.setText("请先选择自己执黑或执白。")
+            return
+        self._clear_correction_state(record=False)
+        self._tracker.reset()
+        self._manual = ManualRelayState()
+        self._manual_history.clear()
+        self._reset_move_history(start_new_game=False)
+        self._session.start_game(color, input_mode=InputMode.MANUAL_RELAY.value)
+        self._set_board(BoardState.empty(), analyze=False)
+        self._refresh_manual_controls()
+        self._manual_maybe_analyze()
+
+    def continue_manual_game(self) -> None:
+        if not self._board.is_count_legal():
+            self._status.setText("当前局面黑白棋数量不合法，无法继续。")
+            return
+        self._manual = ManualRelayState()
+        self._manual_history.clear()
+        self._session.start_game(
+            self._my_color.currentData() if isinstance(self._my_color.currentData(), Stone) else None,
+            input_mode=InputMode.MANUAL_RELAY.value,
+        )
+        self._manual_maybe_analyze()
+        self._refresh_manual_controls()
+
+    def _manual_place(self, x: int, y: int, source: str) -> bool:
+        if not self._board.in_bounds(x, y) or self._board.at(x, y) is not Stone.EMPTY:
+            self._status.setText("该交叉点已有棋子。")
+            return False
+        previous = self._board
+        current = previous.place(x, y)
+        self._manual_history.append(previous)
+        self._record_observed_moves(previous, current, source=source)
+        self._set_board(current, analyze=False)
+        self._refresh_manual_controls()
+        return True
+
+    def _manual_maybe_analyze(self) -> None:
+        color = self._my_color.currentData()
+        if not isinstance(color, Stone):
+            self._status.setText("请先选择自己执黑或执白。")
+            return
+        if self._board.is_terminal():
+            self.analyze_current_board()
+            return
+        if self._board.side_to_move() is color:
+            self._status.setText("正在为你分析下一手...")
+            self.analyze_current_board()
+        else:
+            side = "黑棋" if self._board.side_to_move() is Stone.BLACK else "白棋"
+            self._candidate_text.setText(f"请在左侧录入对方的{side}落子。")
+            self._status.setText("等待对方落子。")
+
+    def _on_manual_relay_point(self, x: int, y: int) -> None:
+        if self._input_mode is not InputMode.MANUAL_RELAY or self._manual.setup:
+            return
+        if self._manual.changing_move:
+            if self._manual_place(x, y, "manual_relay_override"):
+                self._manual.changing_move = False
+                self._manual.pending = True
+                self._manual.pending_before = self._manual_history[-1]
+                self._board_canvas.set_pending_point((x, y))
+                self._candidate_text.setText(
+                    f"已改走 {self._board.coordinate_name(x, y)}，请在真实棋盘落此点。"
+                )
+            return
+        if self._manual.pending:
+            if self._manual_place(x, y, "manual_relay_opponent"):
+                self._manual.pending = False
+                self._manual.pending_before = None
+                self._board_canvas.set_pending_point(None)
+                self._manual_maybe_analyze()
+            return
+        color = self._my_color.currentData()
+        if not isinstance(color, Stone):
+            self._status.setText("请先选择自己执黑或执白。")
+            return
+        source = "manual_relay_manual" if self._board.side_to_move() is color else "manual_relay_opponent"
+        if not self._manual_place(x, y, source):
+            return
+        if source == "manual_relay_manual":
+            self._manual.pending = True
+            self._manual.pending_before = self._manual_history[-1]
+            self._board_canvas.set_pending_point((x, y))
+            self._candidate_text.setText(f"请在真实棋盘落 {self._board.coordinate_name(x, y)}。")
+        else:
+            self._manual_maybe_analyze()
+
+    def change_manual_move(self) -> None:
+        if not self._manual.pending or self._manual.pending_before is None:
+            return
+        self._session.remove_last_move()
+        self._manual_history.pop()
+        before = self._manual.pending_before
+        self._manual.pending = False
+        self._manual.changing_move = True
+        self._manual.pending_before = None
+        candidates = self._candidates
+        self._set_board(before, analyze=False)
+        self._candidates = candidates
+        self._board_canvas.set_candidates(candidates)
+        self._status.setText("点击左侧棋盘选择本手实际落点。")
+        self._refresh_manual_controls()
+
+    def undo_manual_move(self) -> None:
+        if not self._manual_history:
+            return
+        previous = self._manual_history.pop()
+        self._session.remove_last_move()
+        self._manual = ManualRelayState()
+        self._board_canvas.set_pending_point(None)
+        self._set_board(previous, analyze=False)
+        self._refresh_manual_controls()
+        self._manual_maybe_analyze()
+
+    def _toggle_manual_setup(self, enabled: bool) -> None:
+        if self._input_mode is not InputMode.MANUAL_RELAY:
+            return
+        self._manual.setup = enabled
+        self._manual.pending = False
+        self._board_canvas.set_pending_point(None)
+        self._update_edit_mode()
+        self._refresh_manual_controls()
+
+    def finish_manual_setup(self) -> None:
+        if not self._board.is_count_legal():
+            self._status.setText("局面编辑未完成：黑白棋数量不合法。")
+            return
+        self._manual.setup = False
+        self._manual_setup_button.setChecked(False)
+        self._reset_move_history()
+        self._update_edit_mode()
+        self._refresh_manual_controls()
+        self._manual_maybe_analyze()
+
     def _on_manual_board_edit(self, board: BoardState) -> None:
+        if self._input_mode is InputMode.MANUAL_RELAY and self._manual.setup:
+            self._set_board(board, analyze=False)
+            self._status.setText("正在编辑局面。完成后将检查合法性并开始分析。")
+            return
         previous = self._board
         changed = [
             (x, y)
@@ -1379,6 +1639,29 @@ class MainWindow(QMainWindow):
                 self._status.setText("Immediate threats cannot all be blocked.")
             else:
                 self._candidate_text.setText(f"{result.engine_name}: no safe legal move.")
+            return
+        color = self._my_color.currentData()
+        if (
+            self._input_mode is InputMode.MANUAL_RELAY
+            and not self._manual.pending
+            and not self._manual.changing_move
+            and isinstance(color, Stone)
+            and self._board.side_to_move() is color
+        ):
+            chosen = result.candidates[0]
+            before = self._board
+            if self._manual_place(chosen.x, chosen.y, "manual_relay_auto"):
+                self._manual.pending = True
+                self._manual.pending_before = before
+                self._board_canvas.set_pending_point((chosen.x, chosen.y))
+                self._candidates = result.candidates
+                self._board_canvas.set_candidates(result.candidates)
+                self._candidate_text.setText(
+                    f"已自动采用第 1 推荐：{before.coordinate_name(chosen.x, chosen.y)}。"
+                    "请在真实棋盘落此点；对方回应后再录入左侧棋盘。"
+                )
+                self._status.setText("等待对方回应，可在回应前点击“改走本手”。")
+                self._refresh_manual_controls()
             return
         lines: list[str] = []
         if result.recommendation_mode is RecommendationMode.WIN_NOW:
